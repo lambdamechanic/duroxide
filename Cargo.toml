@@ -14,7 +14,7 @@ categories = ["asynchronous", "concurrency"]
 [features]
 default = []
 sqlite = ["sqlx", "libsqlite3-sys"]  # SQLite provider (bundled, no system deps)
-provider-test = ["sqlite"]  # Enable all provider testing infrastructure (requires sqlite)
+provider-test = []  # Provider validation test harness (generic, no provider dependency)
 test = ["provider-test", "test-hooks"]  # Auto-enable provider-test and test-hooks for tests
 test-hooks = []  # Enable test hooks for fault injection in integration tests
 replay-version-test = ["test"]  # Zero-cost: only gates test code for replay engine extensibility verification
@@ -43,8 +43,8 @@ tempfile = "3"
 proptest = "1.4"
 # Metrics test utilities (DebuggingRecorder for snapshot assertions)
 metrics-util = "0.19"
-# Enable sqlite and test-hooks features for integration tests
-duroxide = { path = ".", features = ["sqlite", "test-hooks"] }
+# Enable sqlite, provider-test, and test-hooks features for integration tests
+duroxide = { path = ".", features = ["sqlite", "provider-test", "test-hooks"] }
 
 [workspace]
 members = [
