@@ -2143,8 +2143,20 @@ pub mod instrumented;
 /// ```toml
 /// duroxide = { version = "0.1", features = ["sqlite"] }
 /// ```
+#[cfg(any(feature = "sqlite", feature = "turso"))]
+mod sqlite_common;
+
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+
+/// Turso-backed provider using the SQLite-compatible Turso Rust engine.
+///
+/// Enable with the `turso` feature:
+/// ```toml
+/// duroxide = { version = "0.1", features = ["turso"] }
+/// ```
+#[cfg(feature = "turso")]
+pub mod turso;
 
 // Re-export management types for convenience
 pub use management::{
