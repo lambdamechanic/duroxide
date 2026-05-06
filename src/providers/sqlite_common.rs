@@ -1,5 +1,14 @@
 macro_rules! define_sqlite_like_provider {
     ($provider:ident, $provider_name:literal, $trace_target:literal) => {
+        $crate::providers::sqlite_common::define_sqlite_like_provider!(
+            $provider,
+            $provider_name,
+            $trace_target,
+            bulk_instance_delete
+        );
+    };
+
+    ($provider:ident, $provider_name:literal, $trace_target:literal, $instance_delete_strategy:ident) => {
         /// Default limit for bulk operations when not specified by caller
         const DEFAULT_BULK_OPERATION_LIMIT: u32 = 1000;
 
@@ -3006,62 +3015,12 @@ impl ProviderAdmin for $provider {
             .await
             .map_err(|e| Self::sqlx_to_provider_error("delete_instances_atomic", e))?;
 
-        let instance_rel_sql =
-            format!("SELECT instance_id, parent_instance_id FROM instances WHERE instance_id IN ({placeholders})");
-        let mut rel_query = sqlx::query(&instance_rel_sql);
-        for id in ids {
-            rel_query = rel_query.bind(id);
-        }
-        let rel_rows = rel_query
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| Self::sqlx_to_provider_error("delete_instances_atomic", e))?;
-
-        let ids_set: std::collections::HashSet<String> = ids.iter().cloned().collect();
-        let mut children_by_parent: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        for row in rel_rows {
-            let instance_id: String = row.try_get("instance_id").unwrap_or_default();
-            let parent_instance_id: Option<String> = row.try_get("parent_instance_id").ok().flatten();
-            if let Some(parent_id) = parent_instance_id {
-                if ids_set.contains(&parent_id) {
-                    children_by_parent.entry(parent_id).or_default().push(instance_id);
-                }
-            }
-        }
-
-        fn push_instance_delete_order(
-            instance_id: &str,
-            children_by_parent: &std::collections::HashMap<String, Vec<String>>,
-            visited: &mut std::collections::HashSet<String>,
-            order: &mut Vec<String>,
-        ) {
-            if !visited.insert(instance_id.to_string()) {
-                return;
-            }
-            if let Some(children) = children_by_parent.get(instance_id) {
-                for child_id in children {
-                    push_instance_delete_order(child_id, children_by_parent, visited, order);
-                }
-            }
-            order.push(instance_id.to_string());
-        }
-
-        let mut instance_delete_order = Vec::with_capacity(ids.len());
-        let mut visited = std::collections::HashSet::new();
-        for id in ids {
-            push_instance_delete_order(id, &children_by_parent, &mut visited, &mut instance_delete_order);
-        }
-
-        // Delete instance rows leaf-first for providers that enforce immediate
-        // self-referential foreign keys.
-        for id in &instance_delete_order {
-            sqlx::query("DELETE FROM instances WHERE instance_id = ?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Self::sqlx_to_provider_error("delete_instances_atomic", e))?;
-        }
+        $crate::providers::sqlite_common::define_sqlite_like_provider!(
+            @delete_instance_rows $instance_delete_strategy,
+            tx,
+            ids,
+            placeholders
+        );
 
         tx.commit()
             .await
@@ -3330,6 +3289,79 @@ impl ProviderAdmin for $provider {
 }
     };
 
+    (@delete_instance_rows bulk_instance_delete, $tx:ident, $ids:ident, $placeholders:ident) => {{
+        // Delete instances
+        let del_instances_sql = format!("DELETE FROM instances WHERE instance_id IN ({})", $placeholders);
+        let mut del_query = sqlx::query(&del_instances_sql);
+        for id in $ids {
+            del_query = del_query.bind(id);
+        }
+        del_query
+            .execute(&mut *$tx)
+            .await
+            .map_err(|e| Self::sqlx_to_provider_error("delete_instances_atomic", e))?;
+    }};
+
+    (@delete_instance_rows leaf_first_instance_delete, $tx:ident, $ids:ident, $placeholders:ident) => {{
+        let instance_rel_sql = format!(
+            "SELECT instance_id, parent_instance_id FROM instances WHERE instance_id IN ({})",
+            $placeholders
+        );
+        let mut rel_query = sqlx::query(&instance_rel_sql);
+        for id in $ids {
+            rel_query = rel_query.bind(id);
+        }
+        let rel_rows = rel_query
+            .fetch_all(&mut *$tx)
+            .await
+            .map_err(|e| Self::sqlx_to_provider_error("delete_instances_atomic", e))?;
+
+        let ids_set: std::collections::HashSet<String> = $ids.iter().cloned().collect();
+        let mut children_by_parent: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for row in rel_rows {
+            let instance_id: String = row.try_get("instance_id").unwrap_or_default();
+            let parent_instance_id: Option<String> = row.try_get("parent_instance_id").ok().flatten();
+            if let Some(parent_id) = parent_instance_id {
+                if ids_set.contains(&parent_id) {
+                    children_by_parent.entry(parent_id).or_default().push(instance_id);
+                }
+            }
+        }
+
+        fn push_instance_delete_order(
+            instance_id: &str,
+            children_by_parent: &std::collections::HashMap<String, Vec<String>>,
+            visited: &mut std::collections::HashSet<String>,
+            order: &mut Vec<String>,
+        ) {
+            if !visited.insert(instance_id.to_string()) {
+                return;
+            }
+            if let Some(children) = children_by_parent.get(instance_id) {
+                for child_id in children {
+                    push_instance_delete_order(child_id, children_by_parent, visited, order);
+                }
+            }
+            order.push(instance_id.to_string());
+        }
+
+        let mut instance_delete_order = Vec::with_capacity($ids.len());
+        let mut visited = std::collections::HashSet::new();
+        for id in $ids {
+            push_instance_delete_order(id, &children_by_parent, &mut visited, &mut instance_delete_order);
+        }
+
+        // Turso currently rejects the SQLite-valid bulk self-referential delete,
+        // so delete instance rows leaf-first there.
+        for id in &instance_delete_order {
+            sqlx::query("DELETE FROM instances WHERE instance_id = ?")
+                .bind(id)
+                .execute(&mut *$tx)
+                .await
+                .map_err(|e| Self::sqlx_to_provider_error("delete_instances_atomic", e))?;
+        }
+    }};
 }
 
 pub(crate) use define_sqlite_like_provider;

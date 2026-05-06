@@ -721,4 +721,9 @@ impl TursoProvider {
     }
 }
 
-super::sqlite_common::define_sqlite_like_provider!(TursoProvider, "turso", "duroxide::providers::turso");
+super::sqlite_common::define_sqlite_like_provider!(
+    TursoProvider,
+    "turso",
+    "duroxide::providers::turso",
+    leaf_first_instance_delete
+);
