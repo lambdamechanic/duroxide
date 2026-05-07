@@ -401,7 +401,7 @@ mod sqlx {
     #[derive(Debug, Clone)]
     pub struct DbRow {
         values: Vec<::turso::Value>,
-        columns: HashMap<String, usize>,
+        columns: Arc<HashMap<String, usize>>,
     }
 
     impl Row for DbRow {
@@ -669,18 +669,23 @@ mod sqlx {
     ) -> Result<Vec<DbRow>> {
         let mut rows = conn.query(sql, ::turso::params_from_iter(params)).await?;
         let column_names = rows.column_names();
+        let columns = Arc::new(
+            column_names
+                .iter()
+                .enumerate()
+                .map(|(idx, name)| (name.clone(), idx))
+                .collect(),
+        );
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             let mut values = Vec::with_capacity(row.column_count());
             for idx in 0..row.column_count() {
                 values.push(row.get_value(idx)?);
             }
-            let columns = column_names
-                .iter()
-                .enumerate()
-                .map(|(idx, name)| (name.clone(), idx))
-                .collect();
-            out.push(DbRow { values, columns });
+            out.push(DbRow {
+                values,
+                columns: Arc::clone(&columns),
+            });
         }
         Ok(out)
     }

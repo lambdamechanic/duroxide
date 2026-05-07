@@ -43,7 +43,13 @@ fn temp_db_path(prefix: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    format!("/tmp/duroxide_{prefix}_stress_{}_{}.db", std::process::id(), timestamp)
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "duroxide_{prefix}_stress_{}_{}.db",
+        std::process::id(),
+        timestamp
+    ));
+    path.to_string_lossy().into_owned()
 }
 
 fn cleanup_db_files(db_path: &str) {
