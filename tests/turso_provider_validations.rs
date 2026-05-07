@@ -483,6 +483,93 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn test_turso_begin_concurrent_commit_conflict_exhausts_retry_limit() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("duroxide-concurrent-retry-exhausted.db");
+        let injected_conflicts = Arc::new(AtomicUsize::new(0));
+        let provider = TursoProvider::new(
+            db_path.to_str().unwrap(),
+            Some(TursoOptions {
+                max_connections: 1,
+                journal_mode: TursoJournalMode::Mvcc,
+                transaction_mode: TursoTransactionMode::Concurrent,
+                transaction_max_retries: 1,
+                transaction_retry_initial_backoff: Duration::ZERO,
+                transaction_retry_max_backoff: Duration::ZERO,
+                commit_conflict_injections: Some(injected_conflicts.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let instance = "turso-concurrent-ack-retry-exhausted";
+
+        provider
+            .enqueue_for_orchestrator(
+                WorkItem::StartOrchestration {
+                    instance: instance.to_string(),
+                    orchestration: "ConcurrentAckExhausted".to_string(),
+                    version: Some("1.0.0".to_string()),
+                    input: "{}".to_string(),
+                    parent_instance: None,
+                    parent_id: None,
+                    execution_id: INITIAL_EXECUTION_ID,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (_item, lock_token, _) = provider
+            .fetch_orchestration_item(Duration::from_secs(5), Duration::ZERO, None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        injected_conflicts.store(2, Ordering::SeqCst);
+        let result = provider
+            .ack_orchestration_item(
+                &lock_token,
+                INITIAL_EXECUTION_ID,
+                vec![Event::with_event_id(
+                    INITIAL_EVENT_ID,
+                    instance,
+                    INITIAL_EXECUTION_ID,
+                    None,
+                    EventKind::OrchestrationStarted {
+                        name: "ConcurrentAckExhausted".to_string(),
+                        version: "1.0.0".to_string(),
+                        input: "{}".to_string(),
+                        parent_instance: None,
+                        parent_id: None,
+                        carry_forward_events: None,
+                        initial_custom_status: None,
+                    },
+                )],
+                vec![],
+                vec![],
+                ExecutionMetadata {
+                    orchestration_name: Some("ConcurrentAckExhausted".to_string()),
+                    orchestration_version: Some("1.0.0".to_string()),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await;
+
+        let error = result.expect_err("retry exhaustion should return the final commit conflict");
+        assert_eq!(error.operation, "ack_orchestration_item");
+        assert!(error.retryable);
+        assert_eq!(injected_conflicts.load(Ordering::SeqCst), 0);
+
+        let history = provider.read(instance).await.unwrap();
+        assert!(
+            history.is_empty(),
+            "exhausted retries must not commit partial ack history"
+        );
+    }
+
     // Instance locking tests
     #[tokio::test]
     async fn test_turso_exclusive_instance_lock() {

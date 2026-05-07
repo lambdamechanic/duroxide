@@ -109,6 +109,12 @@ impl FileSqliteFactory {
     }
 }
 
+impl Drop for FileSqliteFactory {
+    fn drop(&mut self) {
+        cleanup_db_files(&self.db_path);
+    }
+}
+
 #[async_trait::async_trait]
 impl ProviderStressFactory for FileSqliteFactory {
     async fn create_provider(&self) -> Arc<dyn Provider> {
@@ -173,6 +179,12 @@ impl FileTursoFactory {
     }
 }
 
+impl Drop for FileTursoFactory {
+    fn drop(&mut self) {
+        cleanup_db_files(&self.db_path);
+    }
+}
+
 #[async_trait::async_trait]
 impl ProviderStressFactory for FileTursoFactory {
     async fn create_provider(&self) -> Arc<dyn Provider> {
@@ -229,11 +241,9 @@ pub async fn run_test_suite(duration_secs: u64) -> Result<(), Box<dyn std::error
                     result,
                 ));
                 info!("✓ Test completed");
-                file_factory.cleanup();
             }
             Err(e) => {
                 info!("✗ Test failed: {}", e);
-                file_factory.cleanup();
             }
         }
     }
@@ -292,8 +302,6 @@ pub async fn run_turso_test_suite(duration_secs: u64) -> Result<(), Box<dyn std:
                 info!("✗ Test failed: {}", e);
             }
         }
-
-        file_factory.cleanup();
     }
 
     info!("\n--- Testing File-Based Turso Provider (MVCC + BEGIN CONCURRENT) ---");
@@ -315,8 +323,6 @@ pub async fn run_turso_test_suite(duration_secs: u64) -> Result<(), Box<dyn std:
                 info!("✗ Test failed: {}", e);
             }
         }
-
-        file_factory.cleanup();
     }
 
     print_comparison_table(&results);

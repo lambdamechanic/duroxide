@@ -1,3 +1,6 @@
+/// Default limit for bulk operations when not specified by caller.
+pub(crate) const DEFAULT_BULK_OPERATION_LIMIT: u32 = 1000;
+
 macro_rules! define_sqlite_like_provider {
     ($provider:ident, $provider_name:literal, $trace_target:literal) => {
         $crate::providers::sqlite_common::define_sqlite_like_provider!(
@@ -46,9 +49,6 @@ macro_rules! define_sqlite_like_provider {
         $ack_lock_strategy:ident,
         $transaction_retry_strategy:ident
     ) => {
-        /// Default limit for bulk operations when not specified by caller
-        const DEFAULT_BULK_OPERATION_LIMIT: u32 = 1000;
-
         impl $provider {
     /// Convert sqlx error to ProviderError with appropriate retry classification
     fn sqlx_to_provider_error(operation: &str, e: sqlx::Error) -> ProviderError {
@@ -1102,14 +1102,14 @@ impl Provider for $provider {
             .pool
             .begin()
             .await
-            .map_err(|e| Self::sqlx_to_provider_error("list_instances", e))?;
+            .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
 
         // Get instance from instance_locks table (we now use instance-level locking)
         let row = sqlx::query("SELECT instance_id FROM instance_locks WHERE lock_token = ?")
             .bind(lock_token)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| Self::sqlx_to_provider_error("list_instances", e))?
+            .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?
             .ok_or_else(|| ProviderError::permanent("ack_orchestration_item", "Invalid lock token"))?;
 
         let instance_id: String = row.try_get("instance_id").map_err(|e| {
@@ -1129,7 +1129,7 @@ impl Provider for $provider {
             .bind(lock_token)
             .execute(&mut *tx)
             .await
-            .map_err(|e| Self::sqlx_to_provider_error("list_instances", e))?;
+            .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
 
         debug!(
             instance = %instance_id,
@@ -1157,7 +1157,7 @@ impl Provider for $provider {
             .bind(&metadata.parent_instance_id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| Self::sqlx_to_provider_error("list_instances", e))?;
+            .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
 
             // Then update with resolved version (will update if instance exists, no-op if just created)
             // Note: parent_instance_id is immutable after creation, so we don't update it here
@@ -1173,7 +1173,7 @@ impl Provider for $provider {
             .bind(&instance_id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| Self::sqlx_to_provider_error("list_instances", e))?;
+            .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
         }
 
         // Create execution record if it doesn't exist (idempotent).
@@ -1226,7 +1226,7 @@ impl Provider for $provider {
         .bind(&instance_id)
         .execute(&mut *tx)
         .await
-        .map_err(|e| Self::sqlx_to_provider_error("list_instances", e))?;
+        .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
 
         // Always append history_delta to the specified execution
         if !history_delta.is_empty() {
@@ -1484,7 +1484,7 @@ impl Provider for $provider {
             .bind(tag)
             .execute(&mut *tx)
             .await
-            .map_err(|e| Self::sqlx_to_provider_error("list_instances", e))?;
+            .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
         }
 
         // Delete cancelled activities (lock stealing) - batch operation
@@ -1554,7 +1554,7 @@ impl Provider for $provider {
                 .bind(visible_at)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| Self::sqlx_to_provider_error("list_instances", e))?;
+                .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
         }
 
         // Validate instance lock is still valid before committing
@@ -1570,7 +1570,7 @@ impl Provider for $provider {
         .bind(now_ms)
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| Self::sqlx_to_provider_error("list_instances", e))?;
+        .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
 
         if lock_valid == 0 {
             // Lock expired or was stolen - abort transaction
@@ -1592,11 +1592,11 @@ impl Provider for $provider {
             .bind(lock_token)
             .execute(&mut *tx)
             .await
-            .map_err(|e| Self::sqlx_to_provider_error("list_instances", e))?;
+            .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
 
         tx.commit()
             .await
-            .map_err(|e| Self::sqlx_to_provider_error("list_instances", e))?;
+            .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
 
         debug!(
             instance = %instance_id,
@@ -3165,7 +3165,9 @@ impl ProviderAdmin for $provider {
         }
 
         // Add limit
-        let limit = filter.limit.unwrap_or(DEFAULT_BULK_OPERATION_LIMIT);
+        let limit = filter
+            .limit
+            .unwrap_or($crate::providers::sqlite_common::DEFAULT_BULK_OPERATION_LIMIT);
         sql.push_str(&format!(" LIMIT {limit}"));
 
         // Build and execute query

@@ -163,7 +163,15 @@ mod sqlx {
         pub async fn execute_on_all(&self, sql: &str) -> Result<()> {
             let mut conns = Vec::with_capacity(self.size);
             for _ in 0..self.size {
-                conns.push(self.acquire().await?);
+                conns.push(
+                    tokio::time::timeout(std::time::Duration::from_secs(60), self.acquire())
+                        .await
+                        .map_err(|_| {
+                            Error::Protocol(
+                                "Timed out acquiring Turso connection for pool-wide initialization".to_string(),
+                            )
+                        })??,
+                );
             }
             for conn in &conns {
                 fetch_all_on_conn(conn.conn(), sql, Vec::new()).await?;
@@ -720,7 +728,7 @@ impl TursoJournalMode {
             Self::Memory => "MEMORY".to_string(),
             Self::Wal => "WAL".to_string(),
             Self::Off => "OFF".to_string(),
-            Self::Mvcc => "'mvcc'".to_string(),
+            Self::Mvcc => "mvcc".to_string(),
             Self::Custom(value) => value.clone(),
         }
     }
@@ -981,6 +989,18 @@ impl TursoProvider {
         })
     }
 
+    /// Create a file-backed Turso store with custom options.
+    ///
+    /// This is an alias for [`Self::new`] that mirrors
+    /// [`Self::new_in_memory_with_options`] for call-site discoverability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if database connection or schema initialization fails.
+    pub async fn new_with_options(database_url: &str, options: Option<TursoOptions>) -> Result<Self, sqlx::Error> {
+        Self::new(database_url, options).await
+    }
+
     async fn try_optional_pragma(pool: &SqlitePool, statement: impl AsRef<str>) {
         let statement = statement.as_ref();
         if let Err(error) = pool.execute_on_all(statement).await {
@@ -1048,7 +1068,12 @@ super::sqlite_common::define_sqlite_like_provider!(
 
 #[cfg(test)]
 mod tests {
-    use super::TursoSynchronous;
+    use super::{TursoJournalMode, TursoSynchronous};
+
+    #[test]
+    fn turso_journal_mode_mvcc_uses_unquoted_pragma_value() {
+        assert_eq!(TursoJournalMode::Mvcc.pragma_value(false), "mvcc");
+    }
 
     #[test]
     fn turso_synchronous_auto_uses_valid_sqlite_values() {
