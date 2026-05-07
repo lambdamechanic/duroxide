@@ -18,6 +18,11 @@ use super::{
 };
 use crate::{Event, EventKind};
 
+// Private compatibility layer that mirrors the small sqlx surface used by the
+// shared SQLite-like provider macro. Keeping the shape close to sqlx lets Turso
+// share the provider implementation while the actual execution goes through the
+// Turso Rust SDK.
+#[doc(hidden)]
 mod sqlx {
     use std::collections::HashMap;
     use std::fmt;
@@ -804,6 +809,20 @@ impl TursoTransactionMode {
 }
 
 /// Configuration options for TursoProvider.
+///
+/// The provider shares most implementation with SQLite through
+/// `define_sqlite_like_provider!`, but Turso opts into these narrower strategy
+/// choices:
+///
+/// | Strategy axis | SQLiteProvider | TursoProvider |
+/// | --- | --- | --- |
+/// | Instance delete | `bulk_instance_delete` | `leaf_first_instance_delete` |
+/// | Ack lock handling | `no_ack_lock_extension` | `extend_ack_lock_at_ack_start` |
+/// | Transaction retry | `no_transaction_retry` | `retry_concurrent_transactions` |
+///
+/// `transaction_mode`, `transaction_max_retries`, and the retry backoff fields
+/// control the retry strategy when [`TursoTransactionMode::Concurrent`] is used.
+/// `ack_lock_extension` controls the Turso-only ack lock extension strategy.
 #[derive(Debug, Clone)]
 pub struct TursoOptions {
     /// Number of Turso connections in the local provider pool.

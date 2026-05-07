@@ -1,6 +1,18 @@
 /// Default limit for bulk operations when not specified by caller.
 pub(crate) const DEFAULT_BULK_OPERATION_LIMIT: u32 = 1000;
 
+// `define_sqlite_like_provider!` keeps the SQLite and Turso provider behavior
+// in one implementation, with provider-specific differences supplied as macro
+// strategy arguments:
+//
+// | Strategy axis          | SQLiteProvider              | TursoProvider                    |
+// |------------------------|-----------------------------|----------------------------------|
+// | Instance delete        | `bulk_instance_delete`      | `leaf_first_instance_delete`     |
+// | Ack lock handling      | `no_ack_lock_extension`     | `extend_ack_lock_at_ack_start`   |
+// | Transaction retry      | `no_transaction_retry`      | `retry_concurrent_transactions`  |
+//
+// The zero-argument and partial macro forms below preserve the original SQLite
+// defaults. Turso opts into the narrower behaviors needed for its engine.
 macro_rules! define_sqlite_like_provider {
     ($provider:ident, $provider_name:literal, $trace_target:literal) => {
         $crate::providers::sqlite_common::define_sqlite_like_provider!(
