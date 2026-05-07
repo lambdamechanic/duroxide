@@ -4,6 +4,10 @@
 
 use self::sqlx::sqlite::SqlitePool;
 use self::sqlx::{Sqlite, Transaction};
+#[cfg(feature = "provider-test")]
+use std::sync::Arc;
+#[cfg(feature = "provider-test")]
+use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
@@ -21,6 +25,8 @@ mod sqlx {
     use std::ops::{Deref, DerefMut};
     use std::sync::Arc;
     use std::sync::Mutex;
+    #[cfg(feature = "provider-test")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -59,13 +65,30 @@ mod sqlx {
         }
     }
 
-    const MAX_CONNECTIONS: usize = 5;
+    impl Error {
+        pub fn is_turso_transaction_retryable(&self) -> bool {
+            match self {
+                Error::Turso(::turso::Error::Busy(_) | ::turso::Error::BusySnapshot(_)) => true,
+                Error::Turso(::turso::Error::Error(msg)) => msg.to_ascii_lowercase().contains("conflict"),
+                _ => false,
+            }
+        }
+    }
+
+    fn is_no_active_transaction_error(error: &::turso::Error) -> bool {
+        matches!(error, ::turso::Error::Error(msg)
+            if msg.to_ascii_lowercase().contains("cannot rollback")
+                && msg.to_ascii_lowercase().contains("no transaction is active"))
+    }
 
     #[derive(Clone)]
     pub struct Pool {
         idle: Arc<Mutex<Vec<ConnectionState>>>,
         available: Arc<Semaphore>,
         size: usize,
+        begin_statement: &'static str,
+        #[cfg(feature = "provider-test")]
+        commit_conflict_injections: Option<Arc<AtomicUsize>>,
     }
 
     struct ConnectionState {
@@ -73,13 +96,22 @@ mod sqlx {
         rollback_needed: bool,
     }
 
+    pub struct PoolOptions {
+        pub max_connections: usize,
+        pub busy_timeout: std::time::Duration,
+        pub begin_statement: &'static str,
+        #[cfg(feature = "provider-test")]
+        pub commit_conflict_injections: Option<Arc<AtomicUsize>>,
+    }
+
     impl Pool {
-        pub async fn connect(path: &str) -> Result<Self> {
+        pub async fn connect(path: &str, options: PoolOptions) -> Result<Self> {
             let db = ::turso::Builder::new_local(path).build().await?;
-            let mut idle = Vec::with_capacity(MAX_CONNECTIONS);
-            for _ in 0..MAX_CONNECTIONS {
+            let max_connections = options.max_connections.max(1);
+            let mut idle = Vec::with_capacity(max_connections);
+            for _ in 0..max_connections {
                 let conn = db.connect()?;
-                conn.busy_timeout(std::time::Duration::from_secs(60))?;
+                conn.busy_timeout(options.busy_timeout)?;
                 idle.push(ConnectionState {
                     conn,
                     rollback_needed: false,
@@ -87,14 +119,17 @@ mod sqlx {
             }
             Ok(Self {
                 idle: Arc::new(Mutex::new(idle)),
-                available: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
-                size: MAX_CONNECTIONS,
+                available: Arc::new(Semaphore::new(max_connections)),
+                size: max_connections,
+                begin_statement: options.begin_statement,
+                #[cfg(feature = "provider-test")]
+                commit_conflict_injections: options.commit_conflict_injections,
             })
         }
 
         pub async fn begin(&self) -> Result<Transaction<'static, Sqlite>> {
             let conn = self.acquire().await?;
-            conn.conn().execute("BEGIN IMMEDIATE", ()).await?;
+            conn.conn().execute(self.begin_statement, ()).await?;
             Ok(Transaction {
                 conn,
                 active: true,
@@ -117,6 +152,8 @@ mod sqlx {
             let mut conn = PooledConnection {
                 state: Some(state),
                 idle: self.idle.clone(),
+                #[cfg(feature = "provider-test")]
+                commit_conflict_injections: self.commit_conflict_injections.clone(),
                 _permit: permit,
             };
             conn.rollback_if_needed().await?;
@@ -138,6 +175,8 @@ mod sqlx {
     pub struct PooledConnection {
         state: Option<ConnectionState>,
         idle: Arc<Mutex<Vec<ConnectionState>>>,
+        #[cfg(feature = "provider-test")]
+        commit_conflict_injections: Option<Arc<AtomicUsize>>,
         _permit: OwnedSemaphorePermit,
     }
 
@@ -149,6 +188,17 @@ mod sqlx {
 
     impl<DB> Transaction<'_, DB> {
         pub async fn commit(mut self) -> Result<()> {
+            #[cfg(feature = "provider-test")]
+            if let Some(injections) = &self.conn.commit_conflict_injections {
+                let injected = injections
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+                    .is_ok();
+                if injected {
+                    return Err(Error::Turso(::turso::Error::BusySnapshot(
+                        "injected BEGIN CONCURRENT commit conflict".to_string(),
+                    )));
+                }
+            }
             self.conn.conn().execute("COMMIT", ()).await?;
             self.active = false;
             Ok(())
@@ -183,7 +233,11 @@ mod sqlx {
         async fn rollback_if_needed(&mut self) -> Result<()> {
             let state = self.state.as_mut().expect("checked-out Turso connection missing");
             if state.rollback_needed {
-                state.conn.execute("ROLLBACK", ()).await?;
+                match state.conn.execute("ROLLBACK", ()).await {
+                    Ok(_) => {}
+                    Err(error) if is_no_active_transaction_error(&error) => {}
+                    Err(error) => return Err(error.into()),
+                }
                 state.rollback_needed = false;
             }
             Ok(())
@@ -632,11 +686,210 @@ mod sqlx {
     }
 }
 
-/// Configuration options for TursoProvider
-#[derive(Debug, Clone, Default)]
+/// Journal mode for Turso's SQLite-compatible engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TursoJournalMode {
+    /// Use `MEMORY` for in-memory databases and `WAL` for file-backed databases.
+    Auto,
+    Delete,
+    Truncate,
+    Persist,
+    Memory,
+    Wal,
+    Off,
+    /// Turso MVCC journal mode. Pair with [`TursoTransactionMode::Concurrent`]
+    /// to use optimistic concurrent transactions.
+    Mvcc,
+    /// Raw PRAGMA value for experimenting with Turso-specific modes.
+    Custom(String),
+}
+
+impl TursoJournalMode {
+    fn pragma_value(&self, is_memory: bool) -> String {
+        match self {
+            Self::Auto if is_memory => "MEMORY".to_string(),
+            Self::Auto => "WAL".to_string(),
+            Self::Delete => "DELETE".to_string(),
+            Self::Truncate => "TRUNCATE".to_string(),
+            Self::Persist => "PERSIST".to_string(),
+            Self::Memory => "MEMORY".to_string(),
+            Self::Wal => "WAL".to_string(),
+            Self::Off => "OFF".to_string(),
+            Self::Mvcc => "'mvcc'".to_string(),
+            Self::Custom(value) => value.clone(),
+        }
+    }
+
+    fn requires_mvcc_schema_compat(&self) -> bool {
+        match self {
+            Self::Mvcc => true,
+            Self::Custom(value) => value.to_ascii_lowercase().contains("mvcc"),
+            _ => false,
+        }
+    }
+}
+
+impl Default for TursoJournalMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Synchronous setting for Turso's SQLite-compatible engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TursoSynchronous {
+    /// Use `OFF` for in-memory databases and `NORMAL` for file-backed databases.
+    Auto,
+    Off,
+    Normal,
+    Full,
+    Extra,
+    /// Raw PRAGMA value for compatibility with Turso/SQLite-specific behavior.
+    Custom(String),
+}
+
+impl TursoSynchronous {
+    fn pragma_value(&self, is_memory: bool) -> String {
+        match self {
+            Self::Auto if is_memory => "OFF".to_string(),
+            Self::Auto => "NORMAL".to_string(),
+            Self::Off => "OFF".to_string(),
+            Self::Normal => "NORMAL".to_string(),
+            Self::Full => "FULL".to_string(),
+            Self::Extra => "EXTRA".to_string(),
+            Self::Custom(value) => value.clone(),
+        }
+    }
+}
+
+impl Default for TursoSynchronous {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Explicit transaction mode used by TursoProvider for multi-statement provider operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TursoTransactionMode {
+    /// Match the existing SQLite-like provider behavior.
+    #[default]
+    Immediate,
+    /// Use Turso's optimistic write transaction mode.
+    ///
+    /// This is opt-in because conflicts can surface at `COMMIT` and require
+    /// replaying the whole provider operation.
+    Concurrent,
+}
+
+impl TursoTransactionMode {
+    fn begin_statement(self) -> &'static str {
+        match self {
+            Self::Immediate => "BEGIN IMMEDIATE",
+            Self::Concurrent => "BEGIN CONCURRENT",
+        }
+    }
+}
+
+/// Configuration options for TursoProvider.
+#[derive(Debug, Clone)]
 pub struct TursoOptions {
-    // Currently empty - lock timeout moved to RuntimeOptions
-    // Kept for future provider-specific options
+    /// Number of Turso connections in the local provider pool.
+    ///
+    /// Default: 5, matching the SQLite provider.
+    pub max_connections: usize,
+
+    /// Busy timeout applied to each Turso connection.
+    ///
+    /// Default: 60 seconds.
+    pub busy_timeout: Duration,
+
+    /// Journal mode PRAGMA. Pair [`TursoJournalMode::Mvcc`] with
+    /// [`TursoTransactionMode::Concurrent`] to use Turso's optimistic
+    /// concurrent write path.
+    ///
+    /// Default: [`TursoJournalMode::Auto`].
+    pub journal_mode: TursoJournalMode,
+
+    /// Synchronous PRAGMA.
+    ///
+    /// Default: [`TursoSynchronous::Auto`].
+    pub synchronous: TursoSynchronous,
+
+    /// WAL checkpoint interval for file-backed databases.
+    ///
+    /// Set to `None` to skip this PRAGMA. Default: `Some(10000)`.
+    pub wal_autocheckpoint: Option<u32>,
+
+    /// SQLite/Turso cache size PRAGMA for file-backed databases.
+    ///
+    /// Negative values are kibibytes. Set to `None` to skip. Default: `Some(-64000)`.
+    pub cache_size: Option<i64>,
+
+    /// Transaction mode for multi-statement provider operations.
+    ///
+    /// Default: [`TursoTransactionMode::Immediate`]. When set to
+    /// [`TursoTransactionMode::Concurrent`], retryable Turso commit conflicts
+    /// replay the whole provider operation with bounded backoff.
+    pub transaction_mode: TursoTransactionMode,
+
+    /// Maximum number of whole-operation retries after a Turso concurrent
+    /// transaction conflict.
+    ///
+    /// Default: 8.
+    pub transaction_max_retries: u32,
+
+    /// Initial backoff before retrying a conflicted concurrent transaction.
+    ///
+    /// Default: 1 millisecond.
+    pub transaction_retry_initial_backoff: Duration,
+
+    /// Maximum backoff between conflicted concurrent transaction retries.
+    ///
+    /// Default: 50 milliseconds.
+    pub transaction_retry_max_backoff: Duration,
+
+    /// Additional lock lifetime applied inside `ack_orchestration_item` before
+    /// long transactional writes start.
+    ///
+    /// This update is part of the ack transaction and is only used to prevent
+    /// the final in-transaction validity check from failing due to wall-clock
+    /// time spent in the same ack transaction. It does not make expired or
+    /// stolen tokens valid.
+    ///
+    /// Set to `None` to disable. Default: 5 minutes.
+    pub ack_lock_extension: Option<Duration>,
+
+    /// Test-only delay injected after the ack lock extension.
+    #[cfg(feature = "provider-test")]
+    #[doc(hidden)]
+    pub ack_delay_after_lock_extension: Option<Duration>,
+
+    /// Test-only count of synthetic commit conflicts to inject.
+    #[cfg(feature = "provider-test")]
+    #[doc(hidden)]
+    pub commit_conflict_injections: Option<Arc<AtomicUsize>>,
+}
+
+impl Default for TursoOptions {
+    fn default() -> Self {
+        Self {
+            max_connections: 5,
+            busy_timeout: Duration::from_secs(60),
+            journal_mode: TursoJournalMode::Auto,
+            synchronous: TursoSynchronous::Auto,
+            wal_autocheckpoint: Some(10000),
+            cache_size: Some(-64000),
+            transaction_mode: TursoTransactionMode::Immediate,
+            transaction_max_retries: 8,
+            transaction_retry_initial_backoff: Duration::from_millis(1),
+            transaction_retry_max_backoff: Duration::from_millis(50),
+            ack_lock_extension: Some(Duration::from_secs(300)),
+            #[cfg(feature = "provider-test")]
+            ack_delay_after_lock_extension: None,
+            #[cfg(feature = "provider-test")]
+            commit_conflict_injections: None,
+        }
+    }
 }
 
 /// Turso-backed provider with full transactional support
@@ -645,6 +898,13 @@ pub struct TursoOptions {
 /// eliminating the race conditions present in the filesystem provider.
 pub struct TursoProvider {
     pool: SqlitePool,
+    transaction_mode: TursoTransactionMode,
+    transaction_max_retries: u32,
+    transaction_retry_initial_backoff: Duration,
+    transaction_retry_max_backoff: Duration,
+    ack_lock_extension: Option<Duration>,
+    #[cfg(feature = "provider-test")]
+    ack_delay_after_lock_extension: Option<Duration>,
 }
 
 impl TursoProvider {
@@ -652,38 +912,89 @@ impl TursoProvider {
     ///
     /// # Arguments
     /// * `database_url` - Local Turso path (e.g., "data.db", "turso:data.db", or ":memory:")
-    /// * `options` - Optional configuration (currently unused, kept for future options)
+    /// * `options` - Optional Turso-specific configuration
     ///
     /// # Errors
     ///
     /// Returns an error if database connection or schema initialization fails.
-    pub async fn new(database_url: &str, _options: Option<TursoOptions>) -> Result<Self, sqlx::Error> {
+    pub async fn new(database_url: &str, options: Option<TursoOptions>) -> Result<Self, sqlx::Error> {
+        let options = options.unwrap_or_default();
         let database_path = Self::normalize_database_path(database_url);
         let is_memory = database_path == ":memory:";
-        let pool = SqlitePool::connect(&database_path).await?;
+        let pool = SqlitePool::connect(
+            &database_path,
+            sqlx::PoolOptions {
+                max_connections: options.max_connections,
+                busy_timeout: options.busy_timeout,
+                begin_statement: options.transaction_mode.begin_statement(),
+                #[cfg(feature = "provider-test")]
+                commit_conflict_injections: options.commit_conflict_injections.clone(),
+            },
+        )
+        .await?;
 
         // Configure Turso's SQLite-compatible engine with the same practical defaults
         // as the sqlx-backed sqlite provider where the PRAGMAs are supported.
-        if is_memory {
-            Self::try_optional_pragma(&pool, "PRAGMA journal_mode = MEMORY").await;
-            Self::try_optional_pragma(&pool, "PRAGMA synchronous = OFF").await;
-        } else {
-            Self::try_optional_pragma(&pool, "PRAGMA journal_mode = WAL").await;
-            Self::try_optional_pragma(&pool, "PRAGMA synchronous = WAL").await;
-            Self::try_optional_pragma(&pool, "PRAGMA wal_autocheckpoint = 10000").await;
-            Self::try_optional_pragma(&pool, "PRAGMA cache_size = -64000").await;
+        Self::try_optional_pragma(
+            &pool,
+            format!("PRAGMA journal_mode = {}", options.journal_mode.pragma_value(is_memory)),
+        )
+        .await;
+        Self::try_optional_pragma(
+            &pool,
+            format!("PRAGMA synchronous = {}", options.synchronous.pragma_value(is_memory)),
+        )
+        .await;
+        if !is_memory {
+            if let Some(wal_autocheckpoint) = options.wal_autocheckpoint {
+                Self::try_optional_pragma(&pool, format!("PRAGMA wal_autocheckpoint = {wal_autocheckpoint}")).await;
+            }
+            if let Some(cache_size) = options.cache_size {
+                Self::try_optional_pragma(&pool, format!("PRAGMA cache_size = {cache_size}")).await;
+            }
         }
         pool.execute_on_all("PRAGMA foreign_keys = ON").await?;
 
-        Self::create_schema(&pool).await?;
+        let queue_id_column = if options.journal_mode.requires_mvcc_schema_compat() {
+            // Turso 0.5.x MVCC rejects AUTOINCREMENT, while plain INTEGER
+            // PRIMARY KEY still gives rowid-backed queue ordering.
+            "id INTEGER PRIMARY KEY"
+        } else {
+            "id INTEGER PRIMARY KEY AUTOINCREMENT"
+        };
+        Self::create_schema_with_queue_id(&pool, queue_id_column).await?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            transaction_mode: options.transaction_mode,
+            transaction_max_retries: options.transaction_max_retries,
+            transaction_retry_initial_backoff: options.transaction_retry_initial_backoff,
+            transaction_retry_max_backoff: options.transaction_retry_max_backoff,
+            ack_lock_extension: options.ack_lock_extension,
+            #[cfg(feature = "provider-test")]
+            ack_delay_after_lock_extension: options.ack_delay_after_lock_extension,
+        })
     }
 
-    async fn try_optional_pragma(pool: &SqlitePool, statement: &'static str) {
+    async fn try_optional_pragma(pool: &SqlitePool, statement: impl AsRef<str>) {
+        let statement = statement.as_ref();
         if let Err(error) = pool.execute_on_all(statement).await {
             debug!(%statement, %error, "optional Turso PRAGMA setup failed");
         }
+    }
+
+    fn should_retry_transaction_operation(&self, error: &ProviderError, retry_count: u32) -> bool {
+        self.transaction_mode == TursoTransactionMode::Concurrent
+            && retry_count < self.transaction_max_retries
+            && error.is_retryable()
+            && error.message.contains("Turso transaction retry")
+    }
+
+    fn transaction_retry_backoff(&self, retry_count: u32) -> Duration {
+        let multiplier = 1u32.checked_shl(retry_count.min(10)).unwrap_or(1);
+        self.transaction_retry_initial_backoff
+            .saturating_mul(multiplier)
+            .min(self.transaction_retry_max_backoff)
     }
 
     fn normalize_database_path(database_url: &str) -> String {
@@ -725,5 +1036,18 @@ super::sqlite_common::define_sqlite_like_provider!(
     TursoProvider,
     "turso",
     "duroxide::providers::turso",
-    leaf_first_instance_delete
+    leaf_first_instance_delete,
+    extend_ack_lock_at_ack_start,
+    retry_concurrent_transactions
 );
+
+#[cfg(test)]
+mod tests {
+    use super::TursoSynchronous;
+
+    #[test]
+    fn turso_synchronous_auto_uses_valid_sqlite_values() {
+        assert_eq!(TursoSynchronous::Auto.pragma_value(true), "OFF");
+        assert_eq!(TursoSynchronous::Auto.pragma_value(false), "NORMAL");
+    }
+}

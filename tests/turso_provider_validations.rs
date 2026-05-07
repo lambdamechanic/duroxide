@@ -170,10 +170,11 @@ mod tests {
         // Queue semantics tests
         test_worker_queue_fifo_ordering,
     };
-    use duroxide::providers::turso::TursoProvider;
-    use duroxide::providers::{ExecutionMetadata, Provider, ProviderAdmin, WorkItem};
+    use duroxide::providers::turso::{TursoJournalMode, TursoOptions, TursoProvider, TursoTransactionMode};
+    use duroxide::providers::{ExecutionMetadata, Provider, ProviderAdmin, TagFilter, WorkItem};
     use duroxide::{Event, EventKind, INITIAL_EVENT_ID, INITIAL_EXECUTION_ID};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     const TEST_LOCK_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -238,6 +239,248 @@ mod tests {
     #[tokio::test]
     async fn test_turso_lock_expiration_during_ack() {
         test_lock_expiration_during_ack(&TursoTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_turso_ack_lock_extension_covers_slow_ack_transaction() {
+        let provider = TursoProvider::new_in_memory_with_options(Some(TursoOptions {
+            ack_lock_extension: Some(Duration::from_secs(2)),
+            ack_delay_after_lock_extension: Some(Duration::from_millis(350)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let instance = "turso-slow-ack-lock-extension";
+
+        provider
+            .enqueue_for_orchestrator(
+                WorkItem::StartOrchestration {
+                    instance: instance.to_string(),
+                    orchestration: "SlowAck".to_string(),
+                    version: Some("1.0.0".to_string()),
+                    input: "{}".to_string(),
+                    parent_instance: None,
+                    parent_id: None,
+                    execution_id: INITIAL_EXECUTION_ID,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (_item, lock_token, _) = provider
+            .fetch_orchestration_item(Duration::from_millis(200), Duration::ZERO, None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        provider
+            .ack_orchestration_item(
+                &lock_token,
+                INITIAL_EXECUTION_ID,
+                vec![Event::with_event_id(
+                    INITIAL_EVENT_ID,
+                    instance,
+                    INITIAL_EXECUTION_ID,
+                    None,
+                    EventKind::OrchestrationStarted {
+                        name: "SlowAck".to_string(),
+                        version: "1.0.0".to_string(),
+                        input: "{}".to_string(),
+                        parent_instance: None,
+                        parent_id: None,
+                        carry_forward_events: None,
+                        initial_custom_status: None,
+                    },
+                )],
+                vec![],
+                vec![],
+                ExecutionMetadata {
+                    orchestration_name: Some("SlowAck".to_string()),
+                    orchestration_version: Some("1.0.0".to_string()),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_turso_ack_lock_extension_rejects_stolen_token() {
+        let provider = TursoProvider::new_in_memory_with_options(Some(TursoOptions {
+            ack_lock_extension: Some(Duration::from_secs(2)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let instance = "turso-stolen-token-after-expiry";
+
+        provider
+            .enqueue_for_orchestrator(
+                WorkItem::StartOrchestration {
+                    instance: instance.to_string(),
+                    orchestration: "StolenToken".to_string(),
+                    version: Some("1.0.0".to_string()),
+                    input: "{}".to_string(),
+                    parent_instance: None,
+                    parent_id: None,
+                    execution_id: INITIAL_EXECUTION_ID,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (_item, stale_token, _) = provider
+            .fetch_orchestration_item(Duration::from_millis(50), Duration::ZERO, None)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (_item, current_token, _) = provider
+            .fetch_orchestration_item(Duration::from_secs(1), Duration::ZERO, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(stale_token, current_token);
+
+        let result = provider
+            .ack_orchestration_item(
+                &stale_token,
+                INITIAL_EXECUTION_ID,
+                vec![],
+                vec![],
+                vec![],
+                ExecutionMetadata::default(),
+                vec![],
+            )
+            .await;
+        assert!(result.is_err(), "stale lock token must not be rescued by ack extension");
+    }
+
+    #[tokio::test]
+    async fn test_turso_begin_concurrent_commit_conflict_retries_ack_without_duplicates() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("duroxide-concurrent-retry.db");
+        let injected_conflicts = Arc::new(AtomicUsize::new(0));
+        let provider = TursoProvider::new(
+            db_path.to_str().unwrap(),
+            Some(TursoOptions {
+                journal_mode: TursoJournalMode::Mvcc,
+                transaction_mode: TursoTransactionMode::Concurrent,
+                transaction_max_retries: 2,
+                transaction_retry_initial_backoff: Duration::ZERO,
+                transaction_retry_max_backoff: Duration::ZERO,
+                commit_conflict_injections: Some(injected_conflicts.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let instance = "turso-concurrent-ack-retry";
+
+        provider
+            .enqueue_for_orchestrator(
+                WorkItem::StartOrchestration {
+                    instance: instance.to_string(),
+                    orchestration: "ConcurrentAck".to_string(),
+                    version: Some("1.0.0".to_string()),
+                    input: "{}".to_string(),
+                    parent_instance: None,
+                    parent_id: None,
+                    execution_id: INITIAL_EXECUTION_ID,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (_item, lock_token, _) = provider
+            .fetch_orchestration_item(Duration::from_secs(5), Duration::ZERO, None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        injected_conflicts.store(1, Ordering::SeqCst);
+        provider
+            .ack_orchestration_item(
+                &lock_token,
+                INITIAL_EXECUTION_ID,
+                vec![Event::with_event_id(
+                    INITIAL_EVENT_ID,
+                    instance,
+                    INITIAL_EXECUTION_ID,
+                    None,
+                    EventKind::OrchestrationStarted {
+                        name: "ConcurrentAck".to_string(),
+                        version: "1.0.0".to_string(),
+                        input: "{}".to_string(),
+                        parent_instance: None,
+                        parent_id: None,
+                        carry_forward_events: None,
+                        initial_custom_status: None,
+                    },
+                )],
+                vec![WorkItem::ActivityExecute {
+                    instance: instance.to_string(),
+                    execution_id: INITIAL_EXECUTION_ID,
+                    id: 2,
+                    name: "DoWork".to_string(),
+                    input: "{}".to_string(),
+                    session_id: None,
+                    tag: None,
+                }],
+                vec![WorkItem::ExternalRaised {
+                    instance: instance.to_string(),
+                    name: "after-ack".to_string(),
+                    data: "{}".to_string(),
+                }],
+                ExecutionMetadata {
+                    orchestration_name: Some("ConcurrentAck".to_string()),
+                    orchestration_version: Some("1.0.0".to_string()),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(injected_conflicts.load(Ordering::SeqCst), 0);
+
+        let history = provider.read(instance).await.unwrap();
+        assert_eq!(history.len(), 1, "retried ack must append history exactly once");
+
+        let (worker_item, worker_token, _) = provider
+            .fetch_work_item(Duration::from_secs(5), Duration::ZERO, None, &TagFilter::Any)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(worker_item, WorkItem::ActivityExecute { id: 2, .. }));
+        provider.ack_work_item(&worker_token, None).await.unwrap();
+        assert!(
+            provider
+                .fetch_work_item(Duration::from_millis(1), Duration::ZERO, None, &TagFilter::Any)
+                .await
+                .unwrap()
+                .is_none(),
+            "retried ack must enqueue worker item exactly once"
+        );
+
+        let (orchestration_item, _, _) = provider
+            .fetch_orchestration_item(Duration::from_secs(5), Duration::ZERO, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            orchestration_item.messages.len(),
+            1,
+            "retried ack must enqueue orchestrator item exactly once"
+        );
+        assert!(matches!(
+            orchestration_item.messages[0],
+            WorkItem::ExternalRaised { ref name, .. } if name == "after-ack"
+        ));
     }
 
     // Instance locking tests

@@ -4,11 +4,48 @@ macro_rules! define_sqlite_like_provider {
             $provider,
             $provider_name,
             $trace_target,
-            bulk_instance_delete
+            bulk_instance_delete,
+            no_ack_lock_extension,
+            no_transaction_retry
         );
     };
 
     ($provider:ident, $provider_name:literal, $trace_target:literal, $instance_delete_strategy:ident) => {
+        $crate::providers::sqlite_common::define_sqlite_like_provider!(
+            $provider,
+            $provider_name,
+            $trace_target,
+            $instance_delete_strategy,
+            no_ack_lock_extension,
+            no_transaction_retry
+        );
+    };
+
+    (
+        $provider:ident,
+        $provider_name:literal,
+        $trace_target:literal,
+        $instance_delete_strategy:ident,
+        $ack_lock_strategy:ident
+    ) => {
+        $crate::providers::sqlite_common::define_sqlite_like_provider!(
+            $provider,
+            $provider_name,
+            $trace_target,
+            $instance_delete_strategy,
+            $ack_lock_strategy,
+            no_transaction_retry
+        );
+    };
+
+    (
+        $provider:ident,
+        $provider_name:literal,
+        $trace_target:literal,
+        $instance_delete_strategy:ident,
+        $ack_lock_strategy:ident,
+        $transaction_retry_strategy:ident
+    ) => {
         /// Default limit for bulk operations when not specified by caller
         const DEFAULT_BULK_OPERATION_LIMIT: u32 = 1000;
 
@@ -16,6 +53,13 @@ macro_rules! define_sqlite_like_provider {
     /// Convert sqlx error to ProviderError with appropriate retry classification
     fn sqlx_to_provider_error(operation: &str, e: sqlx::Error) -> ProviderError {
         let error_msg = e.to_string();
+
+        if $crate::providers::sqlite_common::define_sqlite_like_provider!(
+            @is_transaction_retry_sqlx_error $transaction_retry_strategy,
+            &e
+        ) {
+            return ProviderError::retryable(operation, format!("Turso transaction retry: {error_msg}"));
+        }
 
         // Check for SQLITE_BUSY (database locked) - retryable
         if error_msg.contains("database is locked") || error_msg.contains("SQLITE_BUSY") {
@@ -36,15 +80,28 @@ macro_rules! define_sqlite_like_provider {
         ProviderError::retryable(operation, error_msg)
     }
 
+    async fn run_provider_operation<T, Op, Fut>(&self, operation: &'static str, mut make_attempt: Op) -> Result<T, ProviderError>
+    where
+        Op: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, ProviderError>>,
+    {
+        $crate::providers::sqlite_common::define_sqlite_like_provider!(
+            @run_provider_operation $transaction_retry_strategy,
+            self,
+            operation,
+            make_attempt
+        )
+    }
+
     /// Internal method to enqueue orchestrator work with optional visibility delay
     async fn enqueue_orchestrator_work_with_delay(
         &self,
-        item: WorkItem,
+        item: &WorkItem,
         delay: Option<Duration>,
     ) -> Result<(), ProviderError> {
         let work_item = serde_json::to_string(&item)
             .map_err(|e| ProviderError::permanent("enqueue_for_orchestrator", format!("Serialization error: {e}")))?;
-        let instance = match &item {
+        let instance = match item {
             WorkItem::StartOrchestration { instance, .. }
             | WorkItem::ActivityCompleted { instance, .. }
             | WorkItem::ActivityFailed { instance, .. }
@@ -149,7 +206,12 @@ macro_rules! define_sqlite_like_provider {
     }
 
     /// Create schema directly (for in-memory databases)
+    #[allow(dead_code)]
     async fn create_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+        Self::create_schema_with_queue_id(pool, "id INTEGER PRIMARY KEY AUTOINCREMENT").await
+    }
+
+    async fn create_schema_with_queue_id(pool: &SqlitePool, queue_id_column: &str) -> Result<(), sqlx::Error> {
         // Create all tables
         sqlx::query(
             r#"
@@ -245,10 +307,10 @@ macro_rules! define_sqlite_like_provider {
         .execute(pool)
         .await?;
 
-        sqlx::query(
+        let create_orchestrator_queue = format!(
             r#"
             CREATE TABLE IF NOT EXISTS orchestrator_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                {queue_id_column},
                 instance_id TEXT NOT NULL,
                 work_item TEXT NOT NULL,
                 visible_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -258,14 +320,15 @@ macro_rules! define_sqlite_like_provider {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             "#,
-        )
+        );
+        sqlx::query(&create_orchestrator_queue)
         .execute(pool)
         .await?;
 
-        sqlx::query(
+        let create_worker_queue = format!(
             r#"
             CREATE TABLE IF NOT EXISTS worker_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                {queue_id_column},
                 work_item TEXT NOT NULL,
                 visible_at INTEGER NOT NULL DEFAULT 0,
                 lock_token TEXT,
@@ -279,7 +342,8 @@ macro_rules! define_sqlite_like_provider {
                 tag TEXT
             )
             "#,
-        )
+        );
+        sqlx::query(&create_worker_queue)
         .execute(pool)
         .await?;
 
@@ -523,18 +587,18 @@ macro_rules! define_sqlite_like_provider {
         tx: &mut Transaction<'_, Sqlite>,
         instance: &str,
         execution_id: u64,
-        events: Vec<Event>,
+        events: &[Event],
     ) -> Result<(), sqlx::Error> {
         // Validate that runtime provided concrete event_ids
         // The provider must NOT generate event_ids - they come from the runtime
-        for event in &events {
+        for event in events {
             if event.event_id() == 0 {
                 return Err(sqlx::Error::Protocol("event_id must be set by runtime".into()));
             }
         }
 
         // Insert events
-        for event in &events {
+        for event in events {
             let event_type = match &event.kind {
                 EventKind::OrchestrationStarted { .. } => "OrchestrationStarted",
                 EventKind::OrchestrationCompleted { .. } => "OrchestrationCompleted",
@@ -611,6 +675,7 @@ impl Provider for $provider {
         _poll_timeout: Duration,
         filter: Option<&DispatcherCapabilityFilter>,
     ) -> Result<Option<(OrchestrationItem, String, u32)>, ProviderError> {
+        self.run_provider_operation("fetch_orchestration_item", || async {
         let mut tx = self
             .pool
             .begin()
@@ -1019,6 +1084,7 @@ impl Provider for $provider {
             lock_token,
             max_attempt_count,
         )))
+        }).await
     }
 
     async fn ack_orchestration_item(
@@ -1031,6 +1097,7 @@ impl Provider for $provider {
         metadata: crate::providers::ExecutionMetadata,
         cancelled_activities: Vec<ScheduledActivityIdentifier>,
     ) -> Result<(), ProviderError> {
+        self.run_provider_operation("ack_orchestration_item", || async {
         let mut tx = self
             .pool
             .begin()
@@ -1048,6 +1115,13 @@ impl Provider for $provider {
         let instance_id: String = row.try_get("instance_id").map_err(|e| {
             ProviderError::permanent("ack_orchestration_item", format!("Failed to decode instance_id: {e}"))
         })?;
+
+        $crate::providers::sqlite_common::define_sqlite_like_provider!(
+            @extend_ack_lock $ack_lock_strategy,
+            self,
+            tx,
+            lock_token
+        );
 
         // Delete only the messages we fetched (marked with our lock_token)
         // New messages that arrived after fetch will remain in queue for next turn
@@ -1162,7 +1236,7 @@ impl Provider for $provider {
                 first_event = ?history_delta.first().map(std::mem::discriminant),
                 "Appending history delta"
             );
-            self.append_history_in_tx(&mut tx, &instance_id, execution_id, history_delta.clone())
+            self.append_history_in_tx(&mut tx, &instance_id, execution_id, &history_delta)
                 .await
                 .map_err(|e| {
                     ProviderError::permanent("ack_orchestration_item", format!("Failed to append history: {e}"))
@@ -1372,7 +1446,7 @@ impl Provider for $provider {
             "Enqueuing worker items"
         );
         let now_ms = Self::now_millis();
-        for item in worker_items {
+        for item in &worker_items {
             // Extract identity fields from ActivityExecute
             let (activity_instance, activity_execution_id, activity_id, session_id, tag) = match &item {
                 WorkItem::ActivityExecute {
@@ -1446,7 +1520,7 @@ impl Provider for $provider {
         }
 
         // Enqueue orchestrator items within the transaction
-        for item in orchestrator_items {
+        for item in &orchestrator_items {
             let work_item = serde_json::to_string(&item).map_err(|e| {
                 ProviderError::permanent("enqueue_for_orchestrator", format!("Serialization error: {e}"))
             })?;
@@ -1530,6 +1604,7 @@ impl Provider for $provider {
         );
 
         Ok(())
+        }).await
     }
 
     async fn read(&self, instance: &str) -> Result<Vec<Event>, ProviderError> {
@@ -1614,13 +1689,14 @@ impl Provider for $provider {
         execution_id: u64,
         new_events: Vec<Event>,
     ) -> Result<(), ProviderError> {
+        self.run_provider_operation("append_with_execution", || async {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| Self::sqlx_to_provider_error("append_with_execution", e))?;
 
-        self.append_history_in_tx(&mut tx, instance, execution_id, new_events)
+        self.append_history_in_tx(&mut tx, instance, execution_id, &new_events)
             .await
             .map_err(|e| ProviderError::permanent("append_with_execution", format!("Failed to append history: {e}")))?;
 
@@ -1628,13 +1704,18 @@ impl Provider for $provider {
             .await
             .map_err(|e| Self::sqlx_to_provider_error("append_with_execution", e))?;
         Ok(())
+        }).await
     }
 
     async fn enqueue_for_orchestrator(&self, item: WorkItem, delay: Option<Duration>) -> Result<(), ProviderError> {
-        self.enqueue_orchestrator_work_with_delay(item, delay).await
+        self.run_provider_operation("enqueue_for_orchestrator", || async {
+            self.enqueue_orchestrator_work_with_delay(&item, delay).await
+        })
+        .await
     }
 
     async fn enqueue_for_worker(&self, item: WorkItem) -> Result<(), ProviderError> {
+        self.run_provider_operation("enqueue_for_worker", || async {
         tracing::debug!(target: $trace_target, ?item, "enqueue_for_worker");
 
         // Extract identity fields from ActivityExecute for cancellation support
@@ -1678,6 +1759,7 @@ impl Provider for $provider {
         .map_err(|e| Self::sqlx_to_provider_error("enqueue_for_worker", e))?;
 
         Ok(())
+        }).await
     }
 
     async fn fetch_work_item(
@@ -1692,6 +1774,7 @@ impl Provider for $provider {
             return Ok(None);
         }
 
+        self.run_provider_operation("fetch_work_item", || async {
         let mut tx = self
             .pool
             .begin()
@@ -1858,9 +1941,11 @@ impl Provider for $provider {
             .map_err(|e| Self::sqlx_to_provider_error("fetch_work_item", e))?;
 
         Ok(Some((work_item, lock_token, attempt_count)))
+        }).await
     }
 
     async fn ack_work_item(&self, token: &str, completion: Option<WorkItem>) -> Result<(), ProviderError> {
+        self.run_provider_operation("ack_work_item", || async {
         let mut tx = self
             .pool
             .begin()
@@ -1904,7 +1989,7 @@ impl Provider for $provider {
         }
 
         // Only enqueue completion if provided (None means drop without notifying orchestrator)
-        if let Some(completion) = completion {
+        if let Some(completion) = &completion {
             // Extract instance from completion
             let instance = match &completion {
                 WorkItem::ActivityCompleted { instance, .. } => instance,
@@ -1918,7 +2003,7 @@ impl Provider for $provider {
             };
 
             // Enqueue completion to orchestrator queue
-            let work_item = serde_json::to_string(&completion)
+            let work_item = serde_json::to_string(completion)
                 .map_err(|e| ProviderError::permanent("ack_work_item", format!("Serialization error: {e}")))?;
             let now_ms = Self::now_millis();
 
@@ -1944,9 +2029,11 @@ impl Provider for $provider {
         }
 
         Ok(())
+        }).await
     }
 
     async fn renew_work_item_lock(&self, token: &str, extend_for: Duration) -> Result<(), ProviderError> {
+        self.run_provider_operation("renew_work_item_lock", || async {
         let now_ms = Self::now_millis();
         let locked_until = Self::timestamp_after(extend_for);
 
@@ -1998,6 +2085,7 @@ impl Provider for $provider {
         );
 
         Ok(())
+        }).await
     }
 
     async fn abandon_work_item(
@@ -2006,6 +2094,7 @@ impl Provider for $provider {
         delay: Option<Duration>,
         ignore_attempt: bool,
     ) -> Result<(), ProviderError> {
+        self.run_provider_operation("abandon_work_item", || async {
         // Worker queue uses visible_at for visibility control (like orchestrator queue)
         // When delay is specified, set visible_at to future time to delay retry
         // Always clear lock_token and locked_until since the lock is being released
@@ -2054,9 +2143,11 @@ impl Provider for $provider {
         );
 
         Ok(())
+        }).await
     }
 
     async fn renew_orchestration_item_lock(&self, token: &str, extend_for: Duration) -> Result<(), ProviderError> {
+        self.run_provider_operation("renew_orchestration_item_lock", || async {
         let locked_until = Self::timestamp_after(extend_for);
         let now_ms = Self::now_millis();
 
@@ -2090,6 +2181,7 @@ impl Provider for $provider {
         );
 
         Ok(())
+        }).await
     }
 
     async fn abandon_orchestration_item(
@@ -2098,6 +2190,7 @@ impl Provider for $provider {
         delay: Option<Duration>,
         ignore_attempt: bool,
     ) -> Result<(), ProviderError> {
+        self.run_provider_operation("abandon_orchestration_item", || async {
         let mut tx = self
             .pool
             .begin()
@@ -2155,6 +2248,7 @@ impl Provider for $provider {
             .map_err(|e| Self::sqlx_to_provider_error("abandon_orchestration_item", e))?;
 
         Ok(())
+        }).await
     }
 
     async fn renew_session_lock(
@@ -2163,6 +2257,7 @@ impl Provider for $provider {
         extend_for: Duration,
         idle_timeout: Duration,
     ) -> Result<usize, ProviderError> {
+        self.run_provider_operation("renew_session_lock", || async {
         if owner_ids.is_empty() {
             return Ok(0);
         }
@@ -2201,9 +2296,11 @@ impl Provider for $provider {
             "Session locks renewed"
         );
         Ok(count)
+        }).await
     }
 
     async fn cleanup_orphaned_sessions(&self, _idle_timeout: Duration) -> Result<usize, ProviderError> {
+        self.run_provider_operation("cleanup_orphaned_sessions", || async {
         let now_ms = Self::now_millis();
 
         let result = sqlx::query(
@@ -2227,6 +2324,7 @@ impl Provider for $provider {
             "Orphaned sessions cleaned up"
         );
         Ok(count)
+        }).await
     }
 
     fn as_management_capability(&self) -> Option<&dyn ProviderAdmin> {
@@ -2796,6 +2894,7 @@ impl ProviderAdmin for $provider {
             return Ok(DeleteInstanceResult::default());
         }
 
+        self.run_provider_operation("delete_instances_atomic", || async {
         // Build placeholders for IN clause: ?, ?, ?, ...
         let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
@@ -3028,6 +3127,7 @@ impl ProviderAdmin for $provider {
 
         result.instances_deleted = ids.len() as u64;
         Ok(result)
+        }).await
     }
 
     // delete_instance: uses default implementation from ProviderAdmin trait
@@ -3112,6 +3212,7 @@ impl ProviderAdmin for $provider {
     }
 
     async fn prune_executions(&self, instance_id: &str, options: PruneOptions) -> Result<PruneResult, ProviderError> {
+        self.run_provider_operation("prune_executions", || async {
         // Get current execution ID (never prune this)
         let current_exec_row = sqlx::query("SELECT current_execution_id FROM instances WHERE instance_id = ?")
             .bind(instance_id)
@@ -3222,6 +3323,7 @@ impl ProviderAdmin for $provider {
             .map_err(|e| Self::sqlx_to_provider_error("prune_executions", e))?;
 
         Ok(result)
+        }).await
     }
 
     async fn prune_executions_bulk(
@@ -3362,6 +3464,80 @@ impl ProviderAdmin for $provider {
                 .map_err(|e| Self::sqlx_to_provider_error("delete_instances_atomic", e))?;
         }
     }};
+
+    (@extend_ack_lock no_ack_lock_extension, $self:ident, $tx:ident, $lock_token:ident) => {};
+
+    (@extend_ack_lock extend_ack_lock_at_ack_start, $self:ident, $tx:ident, $lock_token:ident) => {{
+        if let Some(extend_for) = $self.ack_lock_extension {
+            let locked_until = Self::timestamp_after(extend_for);
+            let now_ms = Self::now_millis();
+
+            let result = sqlx::query(
+                r#"
+                UPDATE instance_locks
+                SET locked_until = MAX(locked_until, ?1)
+                WHERE lock_token = ?2
+                  AND locked_until > ?3
+                "#,
+            )
+            .bind(locked_until)
+            .bind($lock_token)
+            .bind(now_ms)
+            .execute(&mut *$tx)
+            .await
+            .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
+
+            if result.rows_affected() == 0 {
+                $tx.rollback().await.ok();
+                return Err(ProviderError::permanent(
+                    "ack_orchestration_item",
+                    "Invalid, expired, or stolen lock token",
+                ));
+            }
+
+            #[cfg(feature = "provider-test")]
+            if let Some(delay) = $self.ack_delay_after_lock_extension {
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }};
+
+    (@is_transaction_retry_sqlx_error no_transaction_retry, $error:expr) => {
+        false
+    };
+
+    (@is_transaction_retry_sqlx_error retry_concurrent_transactions, $error:expr) => {
+        $error.is_turso_transaction_retryable()
+    };
+
+    (@run_provider_operation no_transaction_retry, $self:ident, $operation:ident, $make_attempt:ident) => {{
+        let _ = $self;
+        let _ = $operation;
+        $make_attempt().await
+    }};
+
+    (@run_provider_operation retry_concurrent_transactions, $self:ident, $operation:ident, $make_attempt:ident) => {{
+        let mut retry_count = 0u32;
+        loop {
+            match $make_attempt().await {
+                Ok(value) => break Ok(value),
+                Err(error) if $self.should_retry_transaction_operation(&error, retry_count) => {
+                    let backoff = $self.transaction_retry_backoff(retry_count);
+                    tracing::debug!(
+                        operation = $operation,
+                        retry_count,
+                        backoff_ms = backoff.as_millis(),
+                        error = %error,
+                        "Retrying conflicted Turso transaction operation"
+                    );
+                    retry_count += 1;
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(error) => break Err(error),
+            }
+        }
+    }};
+
 }
 
 pub(crate) use define_sqlite_like_provider;

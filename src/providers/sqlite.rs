@@ -746,7 +746,7 @@ mod tests {
 
         // Enqueue with 2 second delay
         store
-            .enqueue_orchestrator_work_with_delay(delayed_item.clone(), Some(Duration::from_secs(2)))
+            .enqueue_orchestrator_work_with_delay(&delayed_item, Some(Duration::from_secs(2)))
             .await
             .unwrap();
 
