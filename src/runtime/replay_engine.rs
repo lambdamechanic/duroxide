@@ -9,8 +9,11 @@ use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::task::{Context, Poll, Wake, Waker};
 use tracing::{debug, warn};
 
 /// Result of executing an orchestration turn
@@ -576,6 +579,7 @@ impl ReplayEngine {
         let mut open_schedules: HashSet<u64> = HashSet::new();
         let mut schedule_kinds: std::collections::HashMap<u64, ActionKind> = std::collections::HashMap::new();
         let mut emitted_actions: VecDeque<(u64, Action)> = VecDeque::new();
+        let wake_state = Arc::new(ReplayWakeState::default());
 
         let mut must_poll = true;
         let mut output_opt: Option<Result<String, String>> = None;
@@ -605,7 +609,7 @@ impl ReplayEngine {
             }
 
             if must_poll {
-                match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions) {
+                match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions, &wake_state) {
                     Ok(Some(result)) => {
                         output_opt = Some(result);
                         break;
@@ -626,12 +630,15 @@ impl ReplayEngine {
             ) {
                 return err;
             }
+            if wake_state.is_woken() {
+                must_poll = true;
+            }
         }
 
         ctx.set_is_replaying(false);
 
         if must_poll && output_opt.is_none() {
-            match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions) {
+            match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions, &wake_state) {
                 Ok(Some(result)) => output_opt = Some(result),
                 Ok(None) => {}
                 Err(err) => return err,
@@ -647,7 +654,7 @@ impl ReplayEngine {
 
         self.convert_emitted_actions(&ctx, emitted_actions);
 
-        if let Err(err) = self.run_quiescence_loop(&ctx, &mut fut, &mut output_opt) {
+        if let Err(err) = self.run_quiescence_loop(&ctx, &mut fut, &mut output_opt, &wake_state) {
             return err;
         }
 
@@ -658,24 +665,36 @@ impl ReplayEngine {
         fut: &mut Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>,
         ctx: &OrchestrationContext,
         emitted_actions: &mut VecDeque<(u64, Action)>,
+        wake_state: &Arc<ReplayWakeState>,
     ) -> Result<Option<Result<String, String>>, TurnResult> {
-        let poll_result = catch_unwind(AssertUnwindSafe(|| poll_once(fut.as_mut())));
-        match poll_result {
-            Ok(Poll::Ready(result)) => {
-                emitted_actions.extend(ctx.drain_emitted_actions());
-                Ok(Some(result))
-            }
-            Ok(Poll::Pending) => {
-                emitted_actions.extend(ctx.drain_emitted_actions());
-                Ok(None)
-            }
-            Err(panic_payload) => {
-                let msg = extract_panic_message(panic_payload);
-                Err(TurnResult::Failed(crate::ErrorDetails::Application {
-                    kind: crate::AppErrorKind::Panicked,
-                    message: msg,
-                    retryable: false,
-                }))
+        let waker = Waker::from(Arc::clone(wake_state));
+
+        loop {
+            wake_state.take_woken();
+            let poll_result = catch_unwind(AssertUnwindSafe(|| poll_once(fut.as_mut(), &waker)));
+            match poll_result {
+                Ok(Poll::Ready(result)) => {
+                    emitted_actions.extend(ctx.drain_emitted_actions());
+                    return Ok(Some(result));
+                }
+                Ok(Poll::Pending) => {
+                    let drained = ctx.drain_emitted_actions();
+                    let emitted_new_actions = !drained.is_empty();
+                    emitted_actions.extend(drained);
+                    // If this poll emitted durable actions, replay must bind/validate them
+                    // against history before letting wake-driven progress run ahead.
+                    if emitted_new_actions || !wake_state.take_woken() {
+                        return Ok(None);
+                    }
+                }
+                Err(panic_payload) => {
+                    let msg = extract_panic_message(panic_payload);
+                    return Err(TurnResult::Failed(crate::ErrorDetails::Application {
+                        kind: crate::AppErrorKind::Panicked,
+                        message: msg,
+                        retryable: false,
+                    }));
+                }
             }
         }
     }
@@ -985,6 +1004,7 @@ impl ReplayEngine {
         ctx: &OrchestrationContext,
         fut: &mut Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>,
         output_opt: &mut Option<Result<String, String>>,
+        wake_state: &Arc<ReplayWakeState>,
     ) -> Result<(), TurnResult> {
         const MAX_QUIESCENCE_ITERATIONS: usize = 100;
         let mut quiescence_iter = 0;
@@ -994,7 +1014,7 @@ impl ReplayEngine {
             quiescence_iter += 1;
             let actions_before = self.pending_actions.len();
 
-            if let Some(res) = Self::poll_orchestration_future(fut, ctx, &mut emitted_actions)? {
+            if let Some(res) = Self::poll_orchestration_future(fut, ctx, &mut emitted_actions, wake_state)? {
                 *output_opt = Some(res);
             }
             self.convert_emitted_actions(ctx, emitted_actions.drain(..));
@@ -1596,6 +1616,31 @@ impl ReplayEngine {
     }
 }
 
+#[derive(Debug, Default)]
+struct ReplayWakeState {
+    woken: AtomicBool,
+}
+
+impl ReplayWakeState {
+    fn is_woken(&self) -> bool {
+        self.woken.load(Ordering::SeqCst)
+    }
+
+    fn take_woken(&self) -> bool {
+        self.woken.swap(false, Ordering::SeqCst)
+    }
+}
+
+impl Wake for ReplayWakeState {
+    fn wake(self: Arc<Self>) {
+        self.woken.store(true, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.store(true, Ordering::SeqCst);
+    }
+}
+
 impl ReplayEngine {
     // Getter methods for atomic execution
     pub fn history_delta(&self) -> &[Event] {
@@ -1825,13 +1870,8 @@ fn update_action_event_id(action: Action, event_id: u64) -> Action {
 }
 
 /// Poll a future once
-fn poll_once<F: Future + ?Sized>(fut: Pin<&mut F>) -> Poll<F::Output> {
-    // Create a no-op waker
-    static VTABLE: RawWakerVTable =
-        RawWakerVTable::new(|_| RawWaker::new(std::ptr::null(), &VTABLE), |_| {}, |_| {}, |_| {});
-    let raw_waker = RawWaker::new(std::ptr::null(), &VTABLE);
-    let waker = unsafe { Waker::from_raw(raw_waker) };
-    let mut cx = Context::from_waker(&waker);
+fn poll_once<F: Future + ?Sized>(fut: Pin<&mut F>, waker: &Waker) -> Poll<F::Output> {
+    let mut cx = Context::from_waker(waker);
     fut.poll(&mut cx)
 }
 

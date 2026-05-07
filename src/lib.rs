@@ -403,7 +403,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 // Public orchestration primitives and executor
 
@@ -669,15 +669,20 @@ impl<T> Future for DurableFuture<T> {
         match self.inner.as_mut().poll(cx) {
             Poll::Ready(value) => {
                 self.completed = true;
+                self.ctx.clear_token_waker(self.token);
                 Poll::Ready(value)
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                self.ctx.register_token_waker(self.token, cx.waker());
+                Poll::Pending
+            }
         }
     }
 }
 
 impl<T> Drop for DurableFuture<T> {
     fn drop(&mut self) {
+        self.ctx.clear_token_waker(self.token);
         if !self.completed {
             // Future dropped without completing - trigger cancellation.
             // Note: During dehydration (TurnResult::Continue), the orchestration future
@@ -1600,6 +1605,10 @@ struct CtxInner {
     completion_results: std::collections::HashMap<u64, CompletionResult>,
     /// Token -> schedule_id binding (set when replay engine matches action to history)
     token_bindings: std::collections::HashMap<u64, u64>,
+    /// Schedule_id -> token binding for O(1) completion delivery.
+    schedule_bindings: std::collections::HashMap<u64, u64>,
+    /// Last waker observed while each durable token was pending.
+    token_wakers: std::collections::HashMap<u64, Waker>,
     /// External subscriptions: schedule_id -> (name, subscription_index)
     external_subscriptions: std::collections::HashMap<u64, (String, usize)>,
     /// External arrivals: name -> list of payloads in arrival order
@@ -1682,6 +1691,8 @@ impl CtxInner {
             emitted_actions: Vec::new(),
             completion_results: Default::default(),
             token_bindings: Default::default(),
+            schedule_bindings: Default::default(),
+            token_wakers: Default::default(),
             external_subscriptions: Default::default(),
             external_arrivals: Default::default(),
             external_next_index: Default::default(),
@@ -1740,7 +1751,10 @@ impl CtxInner {
 
     /// Bind a token to a schedule_id (called by replay engine when matching action to history).
     fn bind_token(&mut self, token: u64, schedule_id: u64) {
-        self.token_bindings.insert(token, schedule_id);
+        if let Some(old_schedule_id) = self.token_bindings.insert(token, schedule_id) {
+            self.schedule_bindings.remove(&old_schedule_id);
+        }
+        self.schedule_bindings.insert(schedule_id, token);
     }
 
     /// Get the schedule_id bound to a token (returns None if not yet bound).
@@ -1749,23 +1763,35 @@ impl CtxInner {
     }
 
     /// Deliver a completion result for a schedule_id.
-    fn deliver_result(&mut self, schedule_id: u64, result: CompletionResult) {
-        // Find the token that was bound to this schedule_id
-        for (&token, &sid) in &self.token_bindings {
-            if sid == schedule_id {
-                self.completion_results.insert(token, result);
-                return;
-            }
+    fn deliver_result(&mut self, schedule_id: u64, result: CompletionResult) -> Option<Waker> {
+        if let Some(&token) = self.schedule_bindings.get(&schedule_id) {
+            self.completion_results.insert(token, result);
+            return self.token_wakers.remove(&token);
         }
         tracing::warn!(
             schedule_id,
             "dropping completion result with no binding (unsupported for now)"
         );
+        None
     }
 
     /// Check if a result is available for a token.
     fn get_result(&self, token: u64) -> Option<&CompletionResult> {
         self.completion_results.get(&token)
+    }
+
+    fn register_token_waker(&mut self, token: u64, waker: &Waker) {
+        match self.token_wakers.get_mut(&token) {
+            Some(existing) if existing.will_wake(waker) => {}
+            Some(existing) => *existing = waker.clone(),
+            None => {
+                self.token_wakers.insert(token, waker.clone());
+            }
+        }
+    }
+
+    fn clear_token_waker(&mut self, token: u64) {
+        self.token_wakers.remove(&token);
     }
 
     /// Bind an external subscription to a deterministic index.
@@ -2594,7 +2620,26 @@ impl OrchestrationContext {
     /// Deliver a result for a token.
     #[doc(hidden)]
     pub fn deliver_result(&self, schedule_id: u64, result: CompletionResult) {
-        self.inner.lock().unwrap().deliver_result(schedule_id, result);
+        let waker = self.inner.lock().unwrap().deliver_result(schedule_id, result);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn register_token_waker(&self, token: u64, waker: &Waker) {
+        self.inner
+            .lock()
+            .expect("Mutex should not be poisoned")
+            .register_token_waker(token, waker);
+    }
+
+    #[doc(hidden)]
+    pub fn clear_token_waker(&self, token: u64) {
+        self.inner
+            .lock()
+            .expect("Mutex should not be poisoned")
+            .clear_token_waker(token);
     }
 
     /// Returns the orchestration instance identifier.
