@@ -5,8 +5,6 @@
 //! Usage:
 //!   cargo run --release --package duroxide-sqlite-stress --bin turso-stress [DURATION_SECS]
 
-use duroxide_sqlite_stress;
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()

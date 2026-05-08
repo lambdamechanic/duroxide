@@ -226,10 +226,10 @@ mod sqlx {
 
     impl<DB> Drop for Transaction<'_, DB> {
         fn drop(&mut self) {
-            if self.active {
-                if let Some(state) = self.conn.state.as_mut() {
-                    state.rollback_needed = true;
-                }
+            if self.active
+                && let Some(state) = self.conn.state.as_mut()
+            {
+                state.rollback_needed = true;
             }
         }
     }
@@ -713,9 +713,10 @@ mod sqlx {
 }
 
 /// Journal mode for Turso's SQLite-compatible engine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TursoJournalMode {
     /// Use `MEMORY` for in-memory databases and `WAL` for file-backed databases.
+    #[default]
     Auto,
     Delete,
     Truncate,
@@ -755,16 +756,11 @@ impl TursoJournalMode {
     }
 }
 
-impl Default for TursoJournalMode {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
 /// Synchronous setting for Turso's SQLite-compatible engine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TursoSynchronous {
     /// Use `OFF` for in-memory databases and `NORMAL` for file-backed databases.
+    #[default]
     Auto,
     Off,
     Normal,
@@ -785,12 +781,6 @@ impl TursoSynchronous {
             Self::Extra => "EXTRA".to_string(),
             Self::Custom(value) => value.clone(),
         }
-    }
-}
-
-impl Default for TursoSynchronous {
-    fn default() -> Self {
-        Self::Auto
     }
 }
 

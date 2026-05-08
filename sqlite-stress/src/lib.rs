@@ -116,6 +116,13 @@ impl FileSqliteFactory {
 }
 
 #[cfg(feature = "sqlite")]
+impl Default for FileSqliteFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "sqlite")]
 impl Drop for FileSqliteFactory {
     fn drop(&mut self) {
         cleanup_db_files(&self.db_path);
