@@ -899,6 +899,9 @@ pub struct TursoOptions {
     /// the final in-transaction validity check from failing due to wall-clock
     /// time spent in the same ack transaction. It does not make expired or
     /// stolen tokens valid.
+    /// Choose a value comfortably above the expected worst-case
+    /// `ack_orchestration_item` duration for the largest batch size in the
+    /// workload.
     ///
     /// Set to `None` to disable. Default: 5 minutes.
     pub ack_lock_extension: Option<Duration>,
@@ -933,6 +936,113 @@ impl Default for TursoOptions {
             #[cfg(feature = "provider-test")]
             commit_conflict_injections: None,
         }
+    }
+}
+
+/// Builder for [`TursoOptions`].
+#[derive(Debug, Clone)]
+pub struct TursoOptionsBuilder {
+    options: TursoOptions,
+}
+
+impl TursoOptions {
+    /// Start a builder initialized with [`TursoOptions::default`].
+    #[must_use]
+    pub fn builder() -> TursoOptionsBuilder {
+        TursoOptionsBuilder {
+            options: Self::default(),
+        }
+    }
+}
+
+impl Default for TursoOptionsBuilder {
+    fn default() -> Self {
+        TursoOptions::builder()
+    }
+}
+
+impl TursoOptionsBuilder {
+    /// Set the local Turso connection pool size.
+    #[must_use]
+    pub fn max_connections(mut self, max_connections: usize) -> Self {
+        self.options.max_connections = max_connections;
+        self
+    }
+
+    /// Set the busy timeout applied to each Turso connection.
+    #[must_use]
+    pub fn busy_timeout(mut self, busy_timeout: Duration) -> Self {
+        self.options.busy_timeout = busy_timeout;
+        self
+    }
+
+    /// Set the journal mode PRAGMA.
+    #[must_use]
+    pub fn journal_mode(mut self, journal_mode: TursoJournalMode) -> Self {
+        self.options.journal_mode = journal_mode;
+        self
+    }
+
+    /// Set the synchronous PRAGMA.
+    #[must_use]
+    pub fn synchronous(mut self, synchronous: TursoSynchronous) -> Self {
+        self.options.synchronous = synchronous;
+        self
+    }
+
+    /// Set or disable WAL auto-checkpointing.
+    #[must_use]
+    pub fn wal_autocheckpoint(mut self, wal_autocheckpoint: Option<u32>) -> Self {
+        self.options.wal_autocheckpoint = wal_autocheckpoint;
+        self
+    }
+
+    /// Set or disable the SQLite/Turso cache size PRAGMA.
+    #[must_use]
+    pub fn cache_size(mut self, cache_size: Option<i64>) -> Self {
+        self.options.cache_size = cache_size;
+        self
+    }
+
+    /// Set the transaction mode for multi-statement provider operations.
+    #[must_use]
+    pub fn transaction_mode(mut self, transaction_mode: TursoTransactionMode) -> Self {
+        self.options.transaction_mode = transaction_mode;
+        self
+    }
+
+    /// Set the maximum number of whole-operation transaction retries.
+    #[must_use]
+    pub fn transaction_max_retries(mut self, transaction_max_retries: u32) -> Self {
+        self.options.transaction_max_retries = transaction_max_retries;
+        self
+    }
+
+    /// Set the initial retry backoff.
+    #[must_use]
+    pub fn transaction_retry_initial_backoff(mut self, transaction_retry_initial_backoff: Duration) -> Self {
+        self.options.transaction_retry_initial_backoff = transaction_retry_initial_backoff;
+        self
+    }
+
+    /// Set the maximum retry backoff.
+    #[must_use]
+    pub fn transaction_retry_max_backoff(mut self, transaction_retry_max_backoff: Duration) -> Self {
+        self.options.transaction_retry_max_backoff = transaction_retry_max_backoff;
+        self
+    }
+
+    /// Set or disable the Turso ack lock extension.
+    #[must_use]
+    pub fn ack_lock_extension(mut self, ack_lock_extension: Option<Duration>) -> Self {
+        self.options.ack_lock_extension = ack_lock_extension;
+        self
+    }
+
+    /// Finish building options.
+    #[must_use]
+    pub fn build(self) -> TursoOptions {
+        self.options
     }
 }
 
@@ -1100,7 +1210,8 @@ super::sqlite_common::define_sqlite_like_provider!(
 #[cfg(test)]
 mod tests {
     use super::sqlx::IntoDbValue;
-    use super::{TursoJournalMode, TursoSynchronous};
+    use super::{TursoJournalMode, TursoOptions, TursoSynchronous, TursoTransactionMode};
+    use std::time::Duration;
 
     #[test]
     fn turso_journal_mode_mvcc_uses_unquoted_pragma_value() {
@@ -1111,6 +1222,35 @@ mod tests {
     fn turso_synchronous_auto_uses_valid_sqlite_values() {
         assert_eq!(TursoSynchronous::Auto.pragma_value(true), "OFF");
         assert_eq!(TursoSynchronous::Auto.pragma_value(false), "NORMAL");
+    }
+
+    #[test]
+    fn turso_options_builder_sets_complex_configuration() {
+        let options = TursoOptions::builder()
+            .max_connections(7)
+            .busy_timeout(Duration::from_secs(9))
+            .journal_mode(TursoJournalMode::Mvcc)
+            .synchronous(TursoSynchronous::Normal)
+            .wal_autocheckpoint(None)
+            .cache_size(Some(-32000))
+            .transaction_mode(TursoTransactionMode::Concurrent)
+            .transaction_max_retries(3)
+            .transaction_retry_initial_backoff(Duration::from_millis(2))
+            .transaction_retry_max_backoff(Duration::from_millis(20))
+            .ack_lock_extension(Some(Duration::from_secs(45)))
+            .build();
+
+        assert_eq!(options.max_connections, 7);
+        assert_eq!(options.busy_timeout, Duration::from_secs(9));
+        assert_eq!(options.journal_mode, TursoJournalMode::Mvcc);
+        assert_eq!(options.synchronous, TursoSynchronous::Normal);
+        assert_eq!(options.wal_autocheckpoint, None);
+        assert_eq!(options.cache_size, Some(-32000));
+        assert_eq!(options.transaction_mode, TursoTransactionMode::Concurrent);
+        assert_eq!(options.transaction_max_retries, 3);
+        assert_eq!(options.transaction_retry_initial_backoff, Duration::from_millis(2));
+        assert_eq!(options.transaction_retry_max_backoff, Duration::from_millis(20));
+        assert_eq!(options.ack_lock_extension, Some(Duration::from_secs(45)));
     }
 
     #[test]

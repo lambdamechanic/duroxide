@@ -173,11 +173,12 @@ impl FileTursoFactory {
     }
 
     pub fn mvcc_concurrent() -> Self {
-        Self::new(Some(TursoOptions {
-            journal_mode: TursoJournalMode::Mvcc,
-            transaction_mode: TursoTransactionMode::Concurrent,
-            ..Default::default()
-        }))
+        Self::new(Some(
+            TursoOptions::builder()
+                .journal_mode(TursoJournalMode::Mvcc)
+                .transaction_mode(TursoTransactionMode::Concurrent)
+                .build(),
+        ))
     }
 
     pub fn new(options: Option<TursoOptions>) -> Self {
@@ -277,6 +278,9 @@ pub async fn run_turso_test_suite(duration_secs: u64) -> Result<(), Box<dyn std:
     info!("=== Duroxide Turso Stress Test Suite ===");
     info!("Duration: {} seconds per test", duration_secs);
 
+    // Turso runs cover the low-contention baseline and the first concurrent
+    // writer case; wider sweeps belong in targeted workload trials because
+    // MVCC conflicts can replay whole provider operations.
     let concurrency_combos = vec![(1, 1), (2, 2)];
     let mut results = Vec::new();
 
