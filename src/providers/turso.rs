@@ -581,15 +581,23 @@ mod sqlx {
         }
     }
 
+    fn u64_to_turso_integer(value: u64) -> i64 {
+        assert!(
+            value <= i64::MAX as u64,
+            "Turso integer parameters must fit SQLite's signed 64-bit INTEGER range"
+        );
+        value as i64
+    }
+
     impl IntoDbValue for u64 {
         fn into_db_value(self) -> ::turso::Value {
-            ::turso::Value::Integer(self as i64)
+            ::turso::Value::Integer(u64_to_turso_integer(self))
         }
     }
 
     impl IntoDbValue for &u64 {
         fn into_db_value(self) -> ::turso::Value {
-            ::turso::Value::Integer(*self as i64)
+            ::turso::Value::Integer(u64_to_turso_integer(*self))
         }
     }
 
@@ -826,6 +834,10 @@ impl TursoTransactionMode {
 #[derive(Debug, Clone)]
 pub struct TursoOptions {
     /// Number of Turso connections in the local provider pool.
+    ///
+    /// Connections are opened eagerly during provider startup so per-connection
+    /// setup PRAGMAs are applied consistently. Keep this near the expected
+    /// local write concurrency rather than treating it as an unbounded queue.
     ///
     /// Default: 5, matching the SQLite provider.
     pub max_connections: usize,
@@ -1087,6 +1099,7 @@ super::sqlite_common::define_sqlite_like_provider!(
 
 #[cfg(test)]
 mod tests {
+    use super::sqlx::IntoDbValue;
     use super::{TursoJournalMode, TursoSynchronous};
 
     #[test]
@@ -1098,5 +1111,19 @@ mod tests {
     fn turso_synchronous_auto_uses_valid_sqlite_values() {
         assert_eq!(TursoSynchronous::Auto.pragma_value(true), "OFF");
         assert_eq!(TursoSynchronous::Auto.pragma_value(false), "NORMAL");
+    }
+
+    #[test]
+    fn turso_u64_values_bind_as_signed_sqlite_integers() {
+        match 42_u64.into_db_value() {
+            turso::Value::Integer(value) => assert_eq!(value, 42),
+            value => panic!("expected integer binding, got {value:?}"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Turso integer parameters must fit SQLite's signed 64-bit INTEGER range")]
+    fn turso_u64_values_outside_sqlite_integer_range_are_rejected() {
+        let _ = ((i64::MAX as u64) + 1).into_db_value();
     }
 }

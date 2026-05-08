@@ -27,7 +27,9 @@ use duroxide::provider_stress_tests::parallel_orchestrations::{
     run_parallel_orchestrations_test_with_config, ProviderStressFactory,
 };
 use duroxide::provider_stress_tests::{print_comparison_table, StressTestConfig};
+#[cfg(feature = "sqlite")]
 use duroxide::providers::sqlite::SqliteProvider;
+#[cfg(feature = "turso")]
 use duroxide::providers::turso::{TursoJournalMode, TursoOptions, TursoProvider, TursoTransactionMode};
 use duroxide::providers::Provider;
 use std::io::ErrorKind;
@@ -76,8 +78,10 @@ fn stress_config(duration_secs: u64, orch_conc: usize, worker_conc: usize) -> St
 }
 
 /// Factory for creating in-memory SQLite providers for stress testing
+#[cfg(feature = "sqlite")]
 pub struct InMemorySqliteFactory;
 
+#[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl ProviderStressFactory for InMemorySqliteFactory {
     async fn create_provider(&self) -> Arc<dyn Provider> {
@@ -90,10 +94,12 @@ impl ProviderStressFactory for InMemorySqliteFactory {
 }
 
 /// Factory for creating file-based SQLite providers for stress testing
+#[cfg(feature = "sqlite")]
 pub struct FileSqliteFactory {
     db_path: String,
 }
 
+#[cfg(feature = "sqlite")]
 impl FileSqliteFactory {
     pub fn new() -> Self {
         let db_path = temp_db_path("sqlite");
@@ -109,12 +115,14 @@ impl FileSqliteFactory {
     }
 }
 
+#[cfg(feature = "sqlite")]
 impl Drop for FileSqliteFactory {
     fn drop(&mut self) {
         cleanup_db_files(&self.db_path);
     }
 }
 
+#[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl ProviderStressFactory for FileSqliteFactory {
     async fn create_provider(&self) -> Arc<dyn Provider> {
@@ -127,16 +135,19 @@ impl ProviderStressFactory for FileSqliteFactory {
 }
 
 /// Factory for creating in-memory Turso providers for stress testing
+#[cfg(feature = "turso")]
 pub struct InMemoryTursoFactory {
     options: Option<TursoOptions>,
 }
 
+#[cfg(feature = "turso")]
 impl InMemoryTursoFactory {
     pub fn new(options: Option<TursoOptions>) -> Self {
         Self { options }
     }
 }
 
+#[cfg(feature = "turso")]
 #[async_trait::async_trait]
 impl ProviderStressFactory for InMemoryTursoFactory {
     async fn create_provider(&self) -> Arc<dyn Provider> {
@@ -149,11 +160,13 @@ impl ProviderStressFactory for InMemoryTursoFactory {
 }
 
 /// Factory for creating file-based Turso providers for stress testing
+#[cfg(feature = "turso")]
 pub struct FileTursoFactory {
     db_path: String,
     options: Option<TursoOptions>,
 }
 
+#[cfg(feature = "turso")]
 impl FileTursoFactory {
     pub fn immediate() -> Self {
         Self::new(None)
@@ -179,12 +192,14 @@ impl FileTursoFactory {
     }
 }
 
+#[cfg(feature = "turso")]
 impl Drop for FileTursoFactory {
     fn drop(&mut self) {
         cleanup_db_files(&self.db_path);
     }
 }
 
+#[cfg(feature = "turso")]
 #[async_trait::async_trait]
 impl ProviderStressFactory for FileTursoFactory {
     async fn create_provider(&self) -> Arc<dyn Provider> {
@@ -197,6 +212,7 @@ impl ProviderStressFactory for FileTursoFactory {
 }
 
 /// Run the parallel orchestrations stress test suite across SQLite providers and configurations
+#[cfg(feature = "sqlite")]
 pub async fn run_test_suite(duration_secs: u64) -> Result<(), Box<dyn std::error::Error>> {
     info!("=== Duroxide SQLite Stress Test Suite ===");
     info!("Duration: {} seconds per test", duration_secs);
@@ -246,6 +262,7 @@ pub async fn run_test_suite(duration_secs: u64) -> Result<(), Box<dyn std::error
                 info!("✗ Test failed: {}", e);
             }
         }
+        file_factory.cleanup();
     }
 
     // Print comparison table
@@ -255,6 +272,7 @@ pub async fn run_test_suite(duration_secs: u64) -> Result<(), Box<dyn std::error
 }
 
 /// Run the parallel orchestrations stress test suite across Turso modes.
+#[cfg(feature = "turso")]
 pub async fn run_turso_test_suite(duration_secs: u64) -> Result<(), Box<dyn std::error::Error>> {
     info!("=== Duroxide Turso Stress Test Suite ===");
     info!("Duration: {} seconds per test", duration_secs);
@@ -302,6 +320,7 @@ pub async fn run_turso_test_suite(duration_secs: u64) -> Result<(), Box<dyn std:
                 info!("✗ Test failed: {}", e);
             }
         }
+        file_factory.cleanup();
     }
 
     info!("\n--- Testing File-Based Turso Provider (MVCC + BEGIN CONCURRENT) ---");
@@ -323,6 +342,7 @@ pub async fn run_turso_test_suite(duration_secs: u64) -> Result<(), Box<dyn std:
                 info!("✗ Test failed: {}", e);
             }
         }
+        file_factory.cleanup();
     }
 
     print_comparison_table(&results);

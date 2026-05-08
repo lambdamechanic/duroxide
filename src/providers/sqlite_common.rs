@@ -12,7 +12,9 @@ pub(crate) const DEFAULT_BULK_OPERATION_LIMIT: u32 = 1000;
 // | Transaction retry      | `no_transaction_retry`      | `retry_concurrent_transactions`  |
 //
 // The zero-argument and partial macro forms below preserve the original SQLite
-// defaults. Turso opts into the narrower behaviors needed for its engine.
+// defaults. Turso opts into the narrower behaviors needed for its engine. If a
+// compiler error points into a macro expansion for either provider, inspect the
+// generated body here first and then the provider's strategy arguments.
 macro_rules! define_sqlite_like_provider {
     ($provider:ident, $provider_name:literal, $trace_target:literal) => {
         $crate::providers::sqlite_common::define_sqlite_like_provider!(
@@ -167,6 +169,9 @@ macro_rules! define_sqlite_like_provider {
     ///
     /// Returns an error if the checkpoint operation fails.
     pub async fn checkpoint(&self) -> Result<(), sqlx::Error> {
+        // Turso returns rows for WAL checkpoint PRAGMAs, so the shared helper
+        // consumes any result rows while preserving this method's `Result<()>`
+        // behavior for callers.
         sqlx::query("PRAGMA wal_checkpoint(FULL)").fetch_all(&self.pool).await?;
         Ok(())
     }
