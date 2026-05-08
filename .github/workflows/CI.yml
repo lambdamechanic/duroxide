@@ -5,24 +5,42 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  format:
+    name: Format
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Install nextest
-      uses: taiki-e/install-action@nextest
-    - name: Build
-      run: cargo build --all-features --verbose
-    - name: Run tests (two-pass)
-      # Pass 1: --all-features (v2 acceptance tests)
-      # Pass 2: no features    (v1 serde rejection tests)
-      run: ./run-tests.sh
-    - name: Run doc tests
-      run: cargo test --doc --all-features
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features
+
+  build-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Build
+        run: cargo build --workspace --all-features --verbose
+      - name: Run tests (two-pass)
+        # Pass 1: --all-features (v2 acceptance tests)
+        # Pass 2: no features    (v1 serde rejection tests)
+        run: ./run-tests.sh
+      - name: Run doc tests
+        run: cargo test --doc --workspace --all-features
