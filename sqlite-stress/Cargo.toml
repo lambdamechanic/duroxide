@@ -7,6 +7,11 @@ edition = "2021"
 name = "duroxide_sqlite_stress"
 path = "src/lib.rs"
 
+[features]
+default = ["sqlite", "turso"]
+sqlite = ["duroxide/sqlite"]
+turso = ["duroxide/turso"]
+
 [dependencies]
 duroxide = { path = "..", features = ["provider-test"] }
 tokio = { version = "1", features = ["full"] }
@@ -19,3 +24,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [[bin]]
 name = "sqlite-stress"
 path = "src/bin/sqlite-stress.rs"
+required-features = ["sqlite"]
+
+[[bin]]
+name = "large-payload-stress"
+path = "src/bin/large-payload-stress.rs"
+required-features = ["sqlite"]
+
+[[bin]]
+name = "turso-stress"
+path = "src/bin/turso-stress.rs"
+required-features = ["turso"]

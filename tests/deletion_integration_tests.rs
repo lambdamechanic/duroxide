@@ -1,15 +1,21 @@
 //! Integration tests for deletion operations via Client API.
 //!
-//! These tests verify end-to-end deletion behavior with real orchestration execution.
+//! These tests mostly verify end-to-end deletion behavior with real orchestration
+//! execution. Tests that only need a specific persisted state seed that state
+//! directly through the provider API.
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::clone_on_ref_ptr)]
 #![allow(clippy::expect_used)]
 
+use duroxide::providers::{ExecutionMetadata, Provider, TagFilter, WorkItem};
 use duroxide::runtime::registry::ActivityRegistry;
 use duroxide::runtime::{self, RuntimeOptions};
-use duroxide::{ActivityContext, Client, OrchestrationContext, OrchestrationRegistry};
+use duroxide::{
+    ActivityContext, Client, Event, EventKind, INITIAL_EVENT_ID, INITIAL_EXECUTION_ID, OrchestrationContext,
+    OrchestrationRegistry,
+};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 mod common;
@@ -36,6 +42,72 @@ async fn wait_for_terminal(client: &Client, instance_id: &str, timeout: Duration
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+async fn seed_running_instance(
+    provider: &dyn Provider,
+    instance: &str,
+    orchestration: &str,
+    blocking_event: Event,
+    worker_items: Vec<WorkItem>,
+    orchestrator_items: Vec<WorkItem>,
+) {
+    provider
+        .enqueue_for_orchestrator(
+            WorkItem::StartOrchestration {
+                instance: instance.to_string(),
+                orchestration: orchestration.to_string(),
+                input: "{}".to_string(),
+                version: Some("1.0.0".to_string()),
+                parent_instance: None,
+                parent_id: None,
+                execution_id: INITIAL_EXECUTION_ID,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (item, lock_token, _) = provider
+        .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
+        .await
+        .unwrap()
+        .expect("start item should be fetchable");
+    assert_eq!(item.instance, instance);
+
+    provider
+        .ack_orchestration_item(
+            &lock_token,
+            INITIAL_EXECUTION_ID,
+            vec![
+                Event::with_event_id(
+                    INITIAL_EVENT_ID,
+                    instance,
+                    INITIAL_EXECUTION_ID,
+                    None,
+                    EventKind::OrchestrationStarted {
+                        name: orchestration.to_string(),
+                        version: "1.0.0".to_string(),
+                        input: "{}".to_string(),
+                        parent_instance: None,
+                        parent_id: None,
+                        carry_forward_events: None,
+                        initial_custom_status: None,
+                    },
+                ),
+                blocking_event,
+            ],
+            worker_items,
+            orchestrator_items,
+            ExecutionMetadata {
+                orchestration_name: Some(orchestration.to_string()),
+                orchestration_version: Some("1.0.0".to_string()),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .unwrap();
 }
 
 // ===== Happy Path Tests =====
@@ -121,90 +193,109 @@ async fn test_delete_terminal_orchestrations() {
 /// Test: force delete orchestrations with various in-flight work
 ///
 /// Covers:
-/// - Waiting on activity
-/// - Waiting on timer
-/// - Waiting on event
-/// - Between turns
+/// - Running instance with a locked activity work item
+/// - Running instance with a future timer item
+/// - Running instance waiting on an external event
 #[tokio::test]
 async fn test_force_delete_in_flight_work() {
     let (store, _temp_dir) = common::create_sqlite_store_disk().await;
     let client = Client::new(store.clone());
 
-    let activity_started = Arc::new(AtomicBool::new(false));
-    let activity_started_clone = activity_started.clone();
-
-    let activities = ActivityRegistry::builder()
-        .register("SlowActivity", move |_ctx: ActivityContext, _input: String| {
-            let started = activity_started_clone.clone();
-            async move {
-                started.store(true, Ordering::SeqCst);
-                // Sleep for a long time - we'll force delete before this completes
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                Ok("done".to_string())
-            }
-        })
-        .build();
-
-    let orchestrations = OrchestrationRegistry::builder()
-        .register(
-            "WaitOnActivity",
-            |ctx: OrchestrationContext, _input: String| async move {
-                ctx.schedule_activity("SlowActivity", "".to_string()).await?;
-                Ok("done".to_string())
+    seed_running_instance(
+        store.as_ref(),
+        "force-activity",
+        "WaitOnActivity",
+        Event::with_event_id(
+            2,
+            "force-activity",
+            INITIAL_EXECUTION_ID,
+            None,
+            EventKind::ActivityScheduled {
+                name: "SlowActivity".to_string(),
+                input: "".to_string(),
+                session_id: None,
+                tag: None,
             },
-        )
-        .register("WaitOnTimer", |ctx: OrchestrationContext, _input: String| async move {
-            ctx.schedule_timer(Duration::from_secs(3600)).await; // 1 hour timer
-            Ok("done".to_string())
-        })
-        .register("WaitOnEvent", |ctx: OrchestrationContext, _input: String| async move {
-            ctx.schedule_wait("my-event").await;
-            Ok("done".to_string())
-        })
-        .build();
-
-    let _rt =
-        runtime::Runtime::start_with_options(store.clone(), activities, orchestrations, fast_runtime_options()).await;
-
-    // Test 1: Force delete while waiting on activity
-    client
-        .start_orchestration("force-activity", "WaitOnActivity", "{}")
+        ),
+        vec![WorkItem::ActivityExecute {
+            instance: "force-activity".to_string(),
+            execution_id: INITIAL_EXECUTION_ID,
+            id: 2,
+            name: "SlowActivity".to_string(),
+            input: "".to_string(),
+            session_id: None,
+            tag: None,
+        }],
+        vec![],
+    )
+    .await;
+    let (work_item, _, _) = store
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
-        .unwrap();
-
-    // Wait for activity to actually start
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !activity_started.load(Ordering::SeqCst) {
-        if std::time::Instant::now() > deadline {
-            panic!("Activity never started");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        .unwrap()
+        .expect("activity work item should be fetchable");
+    assert!(matches!(work_item, WorkItem::ActivityExecute { instance, id: 2, .. } if instance == "force-activity"));
 
     // Note: DeleteInstanceResult fields (executions_deleted, events_deleted, queue_messages_deleted)
     // are tested in provider validation tests (test_delete_terminal_instances, test_delete_cleans_queues_and_locks)
-    // Force delete
+    let info = client.get_instance_info("force-activity").await.unwrap();
+    assert_eq!(info.status, "Running");
+
     let result = client.delete_instance("force-activity", true).await.unwrap();
     assert!(result.instances_deleted >= 1);
     assert!(client.get_instance_info("force-activity").await.is_err());
 
-    // Test 2: Force delete while waiting on timer
-    client
-        .start_orchestration("force-timer", "WaitOnTimer", "{}")
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await; // Let it start
+    const FUTURE_FIRE_AT_MS: u64 = 4_102_444_800_000;
+    seed_running_instance(
+        store.as_ref(),
+        "force-timer",
+        "WaitOnTimer",
+        Event::with_event_id(
+            2,
+            "force-timer",
+            INITIAL_EXECUTION_ID,
+            None,
+            EventKind::TimerCreated {
+                fire_at_ms: FUTURE_FIRE_AT_MS,
+            },
+        ),
+        vec![],
+        vec![WorkItem::TimerFired {
+            instance: "force-timer".to_string(),
+            execution_id: INITIAL_EXECUTION_ID,
+            id: 2,
+            fire_at_ms: FUTURE_FIRE_AT_MS,
+        }],
+    )
+    .await;
+
+    let info = client.get_instance_info("force-timer").await.unwrap();
+    assert_eq!(info.status, "Running");
 
     let result = client.delete_instance("force-timer", true).await.unwrap();
     assert!(result.instances_deleted >= 1);
     assert!(client.get_instance_info("force-timer").await.is_err());
 
-    // Test 3: Force delete while waiting on event
-    client
-        .start_orchestration("force-event", "WaitOnEvent", "{}")
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await; // Let it start
+    seed_running_instance(
+        store.as_ref(),
+        "force-event",
+        "WaitOnEvent",
+        Event::with_event_id(
+            2,
+            "force-event",
+            INITIAL_EXECUTION_ID,
+            None,
+            EventKind::ExternalSubscribed {
+                name: "my-event".to_string(),
+            },
+        ),
+        vec![],
+        vec![],
+    )
+    .await;
+
+    let info = client.get_instance_info("force-event").await.unwrap();
+    assert_eq!(info.status, "Running");
 
     let result = client.delete_instance("force-event", true).await.unwrap();
     assert!(result.instances_deleted >= 1);

@@ -10,8 +10,6 @@
 //!   cargo run --release --bin sqlite-stress 60    # Run for 60 seconds
 //!   cargo run --release --bin sqlite-stress 5     # Quick 5 second test
 
-use duroxide_sqlite_stress;
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing

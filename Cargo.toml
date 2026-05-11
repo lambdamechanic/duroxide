@@ -14,6 +14,7 @@ categories = ["asynchronous", "concurrency"]
 [features]
 default = []
 sqlite = ["sqlx", "libsqlite3-sys"]  # SQLite provider (bundled, no system deps)
+turso = ["dep:turso"]  # Turso provider (SQLite-compatible Rust engine)
 provider-test = []  # Provider validation test harness (generic, no provider dependency)
 test = ["provider-test", "test-hooks"]  # Auto-enable provider-test and test-hooks for tests
 test-hooks = []  # Enable test hooks for fault injection in integration tests
@@ -36,6 +37,7 @@ metrics = "0.24"
 # SQLite support (optional, bundled)
 sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "sqlite", "macros", "migrate", "chrono"], optional = true }
 libsqlite3-sys = { version = ">=0.28", features = ["bundled"], optional = true }
+turso = { version = "0.5.3", default-features = false, optional = true }
 
 [dev-dependencies]
 # Used in tests/examples

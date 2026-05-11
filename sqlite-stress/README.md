@@ -19,6 +19,7 @@ Or run directly:
 ```bash
 cd sqlite-stress
 cargo run --release --bin sqlite-stress [DURATION_SECS]
+cargo run --release --bin turso-stress [DURATION_SECS]
 ```
 
 ## Result Tracking
@@ -69,6 +70,11 @@ cd sqlite-stress
 ### SQLite Providers
 - **In-Memory SQLite**: Fastest execution, no I/O overhead
 - **File-Based SQLite**: Real-world persistence with WAL mode
+
+### Turso Providers
+- **In-Memory Turso**: Local Turso engine without file I/O
+- **File-Based Turso**: Local Turso engine with the default `BEGIN IMMEDIATE` transaction mode
+- **Turso MVCC**: File-backed Turso with `journal_mode = 'mvcc'` and `BEGIN CONCURRENT`
 
 ### Test Scenario
 - **Parallel Orchestrations**: Fan-out/fan-in pattern with concurrent instance execution
@@ -133,10 +139,11 @@ sqlite-stress/
 ├── src/
 │   ├── lib.rs                    # SQLite factory implementations
 │   └── bin/
-│       └── sqlite-stress.rs      # CLI runner
+│       ├── sqlite-stress.rs      # SQLite CLI runner
+│       └── turso-stress.rs       # Turso CLI runner
 ├── Cargo.toml
 ├── README.md
 └── track-results.sh              # Result tracking script
 ```
 
-The factories (`InMemorySqliteFactory` and `FileSqliteFactory`) implement `ProviderStressFactory` from `duroxide::provider_stress_tests`, making them compatible with the generic stress test infrastructure.
+The factories implement `ProviderStressFactory` from `duroxide::provider_stress_tests`, making them compatible with the generic stress test infrastructure.
